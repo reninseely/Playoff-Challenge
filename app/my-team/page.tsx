@@ -4,8 +4,21 @@ import { useEffect, useMemo, useState } from "react";
 import { supabase } from "@/lib/supabase";
 import NavBar from "@/app/components/NavBar";
 
-type Round = { id: string | number; name: string; round_number: number; is_locked: boolean, is_current: boolean};
-type Player = { id: string | number; name: string; team: string; position: string; espn_id: string | null; };
+type Round = {
+  id: string | number;
+  name: string;
+  round_number: number;
+  is_locked: boolean;
+  is_current: boolean;
+};
+
+type Player = {
+  id: string | number;
+  name: string;
+  team: string;
+  position: string;
+  espn_id: string | null;
+};
 
 type SlotKey =
   | "QB"
@@ -42,6 +55,20 @@ type ScoreRow = {
   multiplied_points: number;
 };
 
+function headshotUrl(p: Player) {
+  if (!p.espn_id) return null;
+  // Only players have headshots; DEF we’ll keep placeholder for now
+  if (p.position === "DEF") return null;
+  return `https://a.espncdn.com/i/headshots/nfl/players/full/${p.espn_id}.png`;
+}
+
+function initials(name: string) {
+  const parts = name.trim().split(/\s+/);
+  const a = parts[0]?.[0] ?? "";
+  const b = parts.length > 1 ? parts[parts.length - 1]?.[0] ?? "" : "";
+  return (a + b).toUpperCase();
+}
+
 export default function MyTeamPage() {
   const [loading, setLoading] = useState(true);
   const [rounds, setRounds] = useState<Round[]>([]);
@@ -73,17 +100,19 @@ export default function MyTeamPage() {
 
       setUserId(userData.user.id);
 
-      const [{ data: roundsData, error: roundsError }, { data: playersData, error: playersError }] =
-        await Promise.all([
-          supabase
-            .from("rounds")
-            .select("id, name, round_number, is_locked, is_current")
-            .order("round_number", { ascending: true }),
-          supabase
-            .from("players")
-            .select("id, name, team, position")
-            .order("name", { ascending: true }),
-        ]);
+      const [
+        { data: roundsData, error: roundsError },
+        { data: playersData, error: playersError },
+      ] = await Promise.all([
+        supabase
+          .from("rounds")
+          .select("id, name, round_number, is_locked, is_current")
+          .order("round_number", { ascending: true }),
+        supabase
+          .from("players")
+          .select("id, name, team, position, espn_id")
+          .order("name", { ascending: true }),
+      ]);
 
       setLoading(false);
 
@@ -102,7 +131,6 @@ export default function MyTeamPage() {
 
       const current = r.find((x) => x.is_current);
       setSelectedRoundId(String((current ?? r[0]).id));
-
     }
 
     loadInitial();
@@ -112,6 +140,7 @@ export default function MyTeamPage() {
     () => rounds.find((r) => String(r.id) === String(selectedRoundId)),
     [rounds, selectedRoundId]
   );
+
   const isLocked = selectedRound?.is_locked ?? false;
 
   // Load roster + roster_players whenever userId + selectedRoundId changes
@@ -242,7 +271,9 @@ export default function MyTeamPage() {
       player_id: lineup[s.key] === "" ? null : lineup[s.key],
     }));
 
-    const { error } = await supabase.from("roster_players").upsert(rows, { onConflict: "roster_id,slot" });
+    const { error } = await supabase
+      .from("roster_players")
+      .upsert(rows, { onConflict: "roster_id,slot" });
 
     setSaving(false);
 
@@ -267,7 +298,7 @@ export default function MyTeamPage() {
     return (
       <div>
         <NavBar />
-        <div className="p-6 space-y-2">
+        <div className="p-6 space-y-2 max-w-5xl mx-auto">
           <h1 className="text-2xl font-semibold">My Team</h1>
           <p className="text-sm text-red-600">{error}</p>
         </div>
@@ -280,6 +311,7 @@ export default function MyTeamPage() {
       <NavBar />
 
       <div className="p-6 space-y-6 max-w-5xl mx-auto">
+        {/* Header */}
         <div className="flex items-end justify-between gap-4 flex-wrap">
           <div className="space-y-1">
             <h1 className="text-2xl font-semibold">My Team</h1>
@@ -323,62 +355,122 @@ export default function MyTeamPage() {
         {roundLoading && <div className="text-sm text-gray-600">Loading round...</div>}
         {statusMsg && <div className="text-sm">{statusMsg}</div>}
 
-        {!isLocked ? (
-          <div className="border rounded p-4 space-y-4">
-            {SLOTS.map((s) => {
-              const opts = optionsForSlot(s.key);
-              return (
-                <div key={s.key} className="flex items-center gap-3">
-                  <div className="w-40 font-medium">{s.label}</div>
-                  <select
-                    className="flex-1 border rounded px-3 py-2"
-                    value={lineup[s.key]}
-                    onChange={(e) => setSlot(s.key, e.target.value)}
-                  >
-                    <option value="">-- Select --</option>
-                    {opts.map((p) => (
-                      <option key={String(p.id)} value={String(p.id)}>
-                        {p.name} — {p.team}
-                      </option>
-                    ))}
-                  </select>
+        {/* Grid */}
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+          {SLOTS.map((s) => {
+            const pid = lineup[s.key];
+            const p = pid ? playersById.get(String(pid)) : null;
+            const score = scoresBySlot.get(String(s.key));
+
+            const img = p ? headshotUrl(p) : null;
+
+            return (
+              <div
+                key={s.key}
+                className="border rounded-xl overflow-hidden bg-white shadow-sm"
+              >
+                {/* Image area */}
+                <div className="relative h-36 bg-gray-100 flex items-center justify-center">
+                  {img ? (
+                    // eslint-disable-next-line @next/next/no-img-element
+                    <img
+                      src={img}
+                      alt={p?.name ?? "Player"}
+                      className="h-full w-full object-cover"
+                      onError={(e) => {
+                        // fallback if ESPN image fails
+                        (e.currentTarget as HTMLImageElement).style.display = "none";
+                      }}
+                    />
+                  ) : (
+                    <div className="flex flex-col items-center justify-center text-gray-500">
+                      <div className="w-14 h-14 rounded-full bg-white border flex items-center justify-center text-lg font-semibold">
+                        {p ? (p.position === "DEF" ? p.team : initials(p.name)) : s.label}
+                      </div>
+                      <div className="mt-2 text-xs">{p ? (p.position === "DEF" ? "Defense" : "No photo") : "Empty"}</div>
+                    </div>
+                  )}
+
+                  {/* Slot badge */}
+                  <div className="absolute top-3 left-3">
+                    <span className="text-xs font-semibold bg-white/90 border rounded-full px-2 py-1">
+                      {s.label}
+                    </span>
+                  </div>
+
+                  {/* Locked badge */}
+                  {isLocked && (
+                    <div className="absolute top-3 right-3">
+                      <span className="text-xs font-semibold bg-red-600 text-white rounded-full px-2 py-1">
+                        Locked
+                      </span>
+                    </div>
+                  )}
                 </div>
-              );
-            })}
-          </div>
-        ) : (
-          <div className="border rounded overflow-hidden">
-            <table className="w-full text-sm">
-              <thead className="bg-gray-50">
-                <tr>
-                  <th className="text-left p-2">Slot</th>
-                  <th className="text-left p-2">Player</th>
-                  <th className="text-right p-2">Base</th>
-                  <th className="text-right p-2">Total</th>
-                </tr>
-              </thead>
-              <tbody>
-                {SLOTS.map((s) => {
-                  const pid = lineup[s.key];
-                  const p = pid ? playersById.get(pid) : null;
-                  const score = scoresBySlot.get(String(s.key));
-                  return (
-                    <tr key={s.key} className="border-t">
-                      <td className="p-2 font-medium">{s.label}</td>
-                      <td className="p-2">
-                        {p ? `${p.name} — ${p.team}` : <span className="text-gray-500">—</span>}
-                      </td>
-                      <td className="p-2 text-right">{score ? score.base_points.toFixed(1) : "0.0"}</td>
-                      <td className="p-2 text-right">
-                        {score ? score.multiplied_points.toFixed(1) : "0.0"}
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-          </div>
-        )}
+
+                {/* Content */}
+                <div className="p-4 space-y-3">
+                  {/* Name + team */}
+                  <div className="space-y-1">
+                    <div className="font-semibold leading-tight">
+                      {p ? (
+                        p.position === "DEF" ? (
+                          `${p.name}`
+                        ) : (
+                          p.name
+                        )
+                      ) : (
+                        <span className="text-gray-500">No player selected</span>
+                      )}
+                    </div>
+                    <div className="text-xs text-gray-600">
+                      {p ? `${p.team} — ${p.position}` : `Select an eligible ${s.label}`}
+                    </div>
+                  </div>
+
+                  {/* Selector (only when open) */}
+                  {!isLocked && (
+                    <select
+                      className="w-full border rounded-lg px-3 py-2 text-sm"
+                      value={lineup[s.key]}
+                      onChange={(e) => setSlot(s.key, e.target.value)}
+                    >
+                      <option value="">-- Select --</option>
+                      {optionsForSlot(s.key).map((pl) => (
+                        <option key={String(pl.id)} value={String(pl.id)}>
+                          {pl.name} — {pl.team}
+                        </option>
+                      ))}
+                    </select>
+                  )}
+
+                  {/* Scores (only when locked) */}
+                  {isLocked && (
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="border rounded-lg p-2">
+                        <div className="text-[11px] text-gray-500">Base</div>
+                        <div className="font-semibold tabular-nums">
+                          {score ? score.base_points.toFixed(1) : "0.0"}
+                        </div>
+                      </div>
+                      <div className="border rounded-lg p-2">
+                        <div className="text-[11px] text-gray-500">Total</div>
+                        <div className="font-semibold tabular-nums">
+                          {score ? score.multiplied_points.toFixed(1) : "0.0"}
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Tiny helper footer */}
+        <div className="text-xs text-gray-500">
+          Tip: Players can only be selected once per lineup (including FLEX).
+        </div>
       </div>
     </div>
   );
