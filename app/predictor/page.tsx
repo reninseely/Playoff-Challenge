@@ -401,10 +401,9 @@ export default function PredictorPage() {
             <div className="mt-2 border border-red-300 bg-red-50 text-red-800 rounded p-3 text-sm">
               <div className="font-semibold mb-1">⚠️ Money Game</div>
               <div>
-                This page is for <span className="font-semibold">real money tracking</span> within friends.
+                This page is for <span className="font-semibold">real money tracking</span>.
                 <br />
-                <span className="font-semibold">Only play if you are willing to pay.</span>
-                If you are not interested in gambling, <span className="underline">do not submit picks</span> on this page.
+                <span className="font-semibold">Only submit picks if you are willing to pay.</span>
                 <br />
                 Im guessing the biggest loser will lose around $20. 
                 Unless multiple people guess the exact score, then maybe $30, but thats an extreme case.
