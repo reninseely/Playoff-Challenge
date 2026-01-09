@@ -369,9 +369,19 @@ export default function PredictorPage() {
         <div className="flex items-end justify-between gap-4 flex-wrap">
           <div className="space-y-1">
             <h1 className="text-2xl font-semibold">Game Predictor</h1>
-            <p className="text-sm text-gray-600">
-              Make picks for any round. Results & points appear after the round is locked.
+            <div className="mt-2 border border-red-300 bg-red-50 text-red-800 rounded p-3 text-sm">
+            <div className="font-semibold mb-1">⚠️ Money Game</div>
+            <div>
+                This page is for <span className="font-semibold">real money tracking</span> within our friend group.
+                <br />
+                <span className="font-semibold">Only play if you are willing to pay.</span>
+                If you are not interested in gambling, <span className="underline">do not submit picks</span> on this page.
+            </div>
+            </div>
+            <p className="mt-2 text-sm text-gray-600">
+            Make picks for any round. Results & points appear after the round is locked.
             </p>
+
           </div>
 
           <div className="flex items-end gap-3 flex-wrap">
