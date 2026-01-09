@@ -1,4 +1,4 @@
-"use client";
+"use client"; 
 
 import { useEffect, useMemo, useState } from "react";
 import { useParams } from "next/navigation";
@@ -10,7 +10,7 @@ type Round = {
   name: string;
   round_number: number;
   is_current: boolean;
-  predictor_locked: boolean;
+  predictor_locked: boolean; // legacy / optional display only
 };
 
 type UserRow = {
@@ -60,6 +60,13 @@ function formatKickoff(ts: string | null) {
   }
 }
 
+function isGameLocked(kickoffAt: string | null) {
+  if (!kickoffAt) return false;
+  const t = new Date(kickoffAt).getTime();
+  if (!Number.isFinite(t)) return false;
+  return t <= Date.now();
+}
+
 // --- round persistence helpers ---
 function safeGetLS(key: string) {
   try {
@@ -79,12 +86,6 @@ function pickDefaultRoundId(rounds: Round[], storageKey: string) {
   // A) saved selection wins if valid
   const saved = typeof window !== "undefined" ? safeGetLS(storageKey) : null;
   if (saved && rounds.some((r) => String(r.id) === String(saved))) return String(saved);
-
-  // B) most recent predictor_locked (highest round_number)
-  const locked = rounds
-    .filter((r) => r.predictor_locked)
-    .sort((a, b) => (Number(b.round_number) || 0) - (Number(a.round_number) || 0));
-  if (locked.length > 0) return String(locked[0].id);
 
   // fallback: current
   const current = rounds.find((r) => r.is_current);
@@ -109,17 +110,15 @@ export default function PredictionsByUserPage() {
   const [entryByGame, setEntryByGame] = useState<Record<string, PredictorEntry>>({});
   const [pointsByGame, setPointsByGame] = useState<Record<string, PredictorPointRow>>({});
 
-  const selectedRound = useMemo(
-    () => rounds.find((r) => String(r.id) === String(selectedRoundId)) ?? null,
-    [rounds, selectedRoundId]
-  );
-
-  const locked = selectedRound?.predictor_locked ?? false;
-
   // storage key per viewed username (so viewing different users doesn't overwrite)
   const roundStorageKey = useMemo(
     () => `predict_round_${encodeURIComponent(String(usernameParam).trim().toLowerCase())}`,
     [usernameParam]
+  );
+
+  const selectedRound = useMemo(
+    () => rounds.find((r) => String(r.id) === String(selectedRoundId)) ?? null,
+    [rounds, selectedRoundId]
   );
 
   useEffect(() => {
@@ -181,6 +180,7 @@ export default function PredictionsByUserPage() {
 
       setError(null);
 
+      // Games
       const { data: gamesData, error: gamesError } = await supabase
         .from("predictor_games")
         .select("id, round_id, kickoff_at, away_team, home_team, away_score_final, home_score_final, is_final")
@@ -203,6 +203,7 @@ export default function PredictionsByUserPage() {
 
       const gameIds = g.map((x) => x.id);
 
+      // Entries for target user
       const { data: entriesData, error: entriesError } = await supabase
         .from("predictor_entries")
         .select("game_id, user_id, away_score_pred, home_score_pred")
@@ -219,6 +220,7 @@ export default function PredictionsByUserPage() {
       for (const e of entries) em[e.game_id] = e;
       setEntryByGame(em);
 
+      // Points for target user (safe to load even if not displayed yet)
       const { data: ptsData, error: ptsError } = await supabase
         .from("predictor_points")
         .select("game_id, user_id, weighted_points")
@@ -239,12 +241,18 @@ export default function PredictionsByUserPage() {
     loadRound();
   }, [selectedRoundId, targetUser?.id]);
 
+  // Total only for games that are locked (kicked off)
   const roundTotal = useMemo(() => {
-    if (!locked) return null;
     let sum = 0;
-    for (const g of games) sum += Number(pointsByGame[g.id]?.weighted_points ?? 0);
+    for (const g of games) {
+      if (!isGameLocked(g.kickoff_at)) continue;
+      sum += Number(pointsByGame[g.id]?.weighted_points ?? 0);
+    }
     return sum;
-  }, [games, pointsByGame, locked]);
+  }, [games, pointsByGame]);
+
+  // If literally no games have kicked off yet, we can show a friendlier message
+  const anyLockedGames = useMemo(() => games.some((g) => isGameLocked(g.kickoff_at)), [games]);
 
   if (loading) {
     return (
@@ -278,7 +286,10 @@ export default function PredictionsByUserPage() {
         <div className="flex items-end justify-between gap-4 flex-wrap">
           <div className="space-y-1">
             <h1 className="text-2xl font-semibold">{targetUser?.username} — Predictions</h1>
-            <p className="text-sm text-gray-600">Predictions + results are visible after a round is locked.</p>
+            <p className="text-sm text-gray-600">
+              Predictions are revealed per-game after kickoff (locked). Final + points show after admin enters the final
+              score and recalculates.
+            </p>
           </div>
 
           <div className="space-y-1">
@@ -295,7 +306,6 @@ export default function PredictionsByUserPage() {
                 <option key={r.id} value={r.id}>
                   {r.round_number}. {r.name}
                   {r.is_current ? " (Current)" : ""}
-                  {r.predictor_locked ? " (Locked)" : ""}
                 </option>
               ))}
             </select>
@@ -304,27 +314,70 @@ export default function PredictionsByUserPage() {
 
         {selectedRound ? (
           <div className="text-sm text-gray-600">
-            Viewing: <span className="font-semibold">{selectedRound.name}</span>{" "}
-            {locked ? (
-              <span className="ml-2 text-red-700 font-semibold">(Locked)</span>
-            ) : (
-              <span className="ml-2">(Not locked yet)</span>
-            )}
-            {locked && roundTotal != null ? (
+            Viewing: <span className="font-semibold">{selectedRound.name}</span>
+            {anyLockedGames ? (
               <span className="ml-4">
-                Round Total: <span className="font-semibold">{Math.round(roundTotal)}</span>
+                Locked Games Total: <span className="font-semibold">{Math.round(roundTotal)}</span>
               </span>
-            ) : null}
+            ) : (
+              <span className="ml-4 text-gray-500">(No games have kicked off yet)</span>
+            )}
           </div>
         ) : null}
 
-        {!locked ? (
+        {!anyLockedGames ? (
           <div className="border rounded p-4 text-sm text-gray-600">
-            This round isn’t locked yet — predictions are hidden until the admin locks the round.
+            No games have kicked off yet — predictions will show up here after kickoff.
           </div>
         ) : (
           <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
             {games.map((g) => {
+              const gameLocked = isGameLocked(g.kickoff_at);
+
+              // Hide entirely if not locked yet (this is the key change)
+              if (!gameLocked) {
+                return (
+                  <div key={g.id} className="border rounded p-3 bg-gray-50">
+                    <div className="flex items-start justify-between gap-2">
+                      <div className="text-[11px] text-gray-600 leading-tight">{formatKickoff(g.kickoff_at)}</div>
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-700">Open</span>
+                    </div>
+
+                    <div className="mt-3 text-[12px] text-gray-600">
+                      Locked at kickoff — {targetUser?.username}’s pick will appear after the game starts.
+                    </div>
+
+                    <div className="mt-3 grid grid-cols-3 items-center gap-2 opacity-80">
+                      <div className="flex flex-col items-center gap-1">
+                        <img
+                          src={logoSrc(g.away_team)}
+                          alt={g.away_team}
+                          className="h-14 w-14 object-contain"
+                          onError={(e) => ((e.currentTarget as HTMLImageElement).style.opacity = "0.2")}
+                        />
+                        <div className="text-xs font-semibold">{g.away_team}</div>
+                        <div className="border rounded px-2 py-1 w-12 text-center text-sm bg-white">?</div>
+                      </div>
+
+                      <div className="flex flex-col items-center justify-center">
+                        <div className="text-xs text-gray-500 font-semibold">@</div>
+                      </div>
+
+                      <div className="flex flex-col items-center gap-1">
+                        <img
+                          src={logoSrc(g.home_team)}
+                          alt={g.home_team}
+                          className="h-14 w-14 object-contain"
+                          onError={(e) => ((e.currentTarget as HTMLImageElement).style.opacity = "0.2")}
+                        />
+                        <div className="text-xs font-semibold">{g.home_team}</div>
+                        <div className="border rounded px-2 py-1 w-12 text-center text-sm bg-white">?</div>
+                      </div>
+                    </div>
+                  </div>
+                );
+              }
+
               const entry = entryByGame[g.id];
               const pts = pointsByGame[g.id];
               const finalReady = g.is_final && g.away_score_final != null && g.home_score_final != null;
@@ -333,9 +386,12 @@ export default function PredictionsByUserPage() {
                 <div key={g.id} className="border rounded p-3">
                   <div className="flex items-start justify-between gap-2">
                     <div className="text-[11px] text-gray-600 leading-tight">{formatKickoff(g.kickoff_at)}</div>
-                    {finalReady ? (
-                      <span className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-700">Final</span>
-                    ) : null}
+                    <div className="flex items-center gap-2">
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-gray-900 text-white">Locked</span>
+                      {finalReady ? (
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-700">Final</span>
+                      ) : null}
+                    </div>
                   </div>
 
                   <div className="mt-2 grid grid-cols-3 items-center gap-2">

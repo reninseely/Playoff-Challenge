@@ -38,9 +38,9 @@ function toLocalInputValue(ts: string | null) {
   if (!ts) return "";
   const d = new Date(ts);
   const pad = (n: number) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(
-    d.getMinutes()
-  )}`;
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(
+    d.getHours()
+  )}:${pad(d.getMinutes())}`;
 }
 
 function fromLocalInputValue(v: string) {
@@ -52,6 +52,14 @@ function fromLocalInputValue(v: string) {
 
 function logoSrc(abbr: string) {
   return `/defenses/${abbr}.png`;
+}
+
+function isGameLockedByKickoff(kickoffLocalInputValue: string) {
+  // kickoffLocalInputValue is like "2026-01-09T18:00" (local time)
+  if (!kickoffLocalInputValue) return false;
+  const d = new Date(kickoffLocalInputValue);
+  if (isNaN(d.getTime())) return false;
+  return d.getTime() <= Date.now();
 }
 
 export default function AdminPredictorPage() {
@@ -67,6 +75,13 @@ export default function AdminPredictorPage() {
   const [rows, setRows] = useState<EditRow[]>([]);
   const [saving, setSaving] = useState(false);
   const [recalculating, setRecalculating] = useState(false);
+
+  // Re-evaluate "locked" badges over time (so a game flips to locked at kickoff without refresh)
+  const [nowTick, setNowTick] = useState(0);
+  useEffect(() => {
+    const t = setInterval(() => setNowTick((x) => x + 1), 30_000); // every 30s
+    return () => clearInterval(t);
+  }, []);
 
   async function loadProfileAndRounds() {
     setError(null);
@@ -124,7 +139,9 @@ export default function AdminPredictorPage() {
 
     const { data, error } = await supabase
       .from("predictor_games")
-      .select("id, round_id, kickoff_at, away_team, home_team, away_score_final, home_score_final, is_final")
+      .select(
+        "id, round_id, kickoff_at, away_team, home_team, away_score_final, home_score_final, is_final"
+      )
       .eq("round_id", roundId)
       .order("kickoff_at", { ascending: true });
 
@@ -202,6 +219,11 @@ export default function AdminPredictorPage() {
     if (!r.away_team.trim() || !r.home_team.trim()) return "Away/Home team are required.";
     if (r.away_team.trim().length > 10 || r.home_team.trim().length > 10)
       return "Team abbreviations look too long.";
+
+    // If kickoff is blank, still allow saving (you might want to set later),
+    // but warning could be useful.
+    // if (!r.kickoff_at) return "Kickoff time is required.";
+
     if (r.is_final) {
       if (r.away_score_final.trim() === "" || r.home_score_final.trim() === "")
         return "Final scores required if marked Final.";
@@ -232,6 +254,7 @@ export default function AdminPredictorPage() {
 
     setSaving(true);
 
+    // INSERTS: always include round_id
     const inserts = rows
       .filter((r) => isNewId(r.id))
       .map((r) => ({
@@ -244,7 +267,7 @@ export default function AdminPredictorPage() {
         is_final: r.is_final,
       }));
 
-    // ✅ FIX: include round_id on updates too (prevents round_id NULL upsert edge-cases)
+    // UPDATES: include round_id to avoid NULL constraint edge-cases
     const updates = rows
       .filter((r) => !isNewId(r.id))
       .map((r) => ({
@@ -309,8 +332,16 @@ export default function AdminPredictorPage() {
     setError(null);
     setStatusMsg(null);
 
+    const row = rows.find((x) => x.id === gameId);
+    const locked = row ? isGameLockedByKickoff(row.kickoff_at) : false;
+
     if (isNewId(gameId)) {
       removeRow(gameId);
+      return;
+    }
+
+    if (locked) {
+      setError("This game is locked (kickoff has passed). Deleting it is disabled for safety.");
       return;
     }
 
@@ -358,7 +389,9 @@ export default function AdminPredictorPage() {
         <div className="flex items-end justify-between gap-4 flex-wrap">
           <div>
             <h1 className="text-2xl font-semibold">Predictor Admin</h1>
-            <p className="text-sm text-gray-600">Add matchups and enter final scores.</p>
+            <p className="text-sm text-gray-600">
+              Add matchups, manage kickoff times, and enter final scores. Games lock automatically at kickoff.
+            </p>
           </div>
 
           <div className="flex items-center gap-3">
@@ -423,6 +456,7 @@ export default function AdminPredictorPage() {
           <table className="w-full text-sm">
             <thead className="bg-gray-50">
               <tr>
+                <th className="text-left p-2">Locked</th>
                 <th className="text-left p-2">Kickoff</th>
                 <th className="text-left p-2">Away</th>
                 <th className="text-left p-2">Home</th>
@@ -430,106 +464,149 @@ export default function AdminPredictorPage() {
                 <th className="text-left p-2">Action</th>
               </tr>
             </thead>
+
             <tbody>
-              {rows.map((r) => (
-                <tr key={r.id} className="border-t align-top">
-                  <td className="p-2">
-                    <input
-                      type="datetime-local"
-                      className="border rounded px-2 py-1"
-                      value={r.kickoff_at}
-                      onChange={(e) => updateRow(r.id, { kickoff_at: e.target.value })}
-                    />
-                  </td>
+              {rows.map((r) => {
+                // uses nowTick so it updates without refresh
+                void nowTick;
+                const locked = isGameLockedByKickoff(r.kickoff_at);
 
-                  <td className="p-2">
-                    <div className="flex items-center gap-2">
-                      <img
-                        src={r.away_team ? logoSrc(r.away_team.trim().toUpperCase()) : ""}
-                        alt=""
-                        className="h-8 w-8 object-contain"
-                        onError={(e) => ((e.currentTarget as HTMLImageElement).style.opacity = "0.2")}
-                      />
+                // When locked: prevent changing kickoff/teams.
+                // Still allow final score entry & is_final toggle.
+                const disableStructureEdits = locked && !isNewId(r.id);
+
+                return (
+                  <tr key={r.id} className="border-t align-top">
+                    <td className="p-2">
+                      {locked ? (
+                        <span className="text-xs font-semibold text-red-700">Locked</span>
+                      ) : (
+                        <span className="text-xs text-gray-500">Open</span>
+                      )}
+                    </td>
+
+                    <td className="p-2">
                       <input
-                        className="border rounded px-2 py-1 w-24"
-                        placeholder="BUF"
-                        value={r.away_team}
-                        onChange={(e) => updateRow(r.id, { away_team: e.target.value })}
+                        type="datetime-local"
+                        className="border rounded px-2 py-1"
+                        value={r.kickoff_at}
+                        onChange={(e) => updateRow(r.id, { kickoff_at: e.target.value })}
+                        disabled={disableStructureEdits}
+                        title={
+                          disableStructureEdits
+                            ? "Kickoff has passed. Editing kickoff time is disabled."
+                            : ""
+                        }
                       />
-                    </div>
-                  </td>
+                    </td>
 
-                  <td className="p-2">
-                    <div className="flex items-center gap-2">
-                      <img
-                        src={r.home_team ? logoSrc(r.home_team.trim().toUpperCase()) : ""}
-                        alt=""
-                        className="h-8 w-8 object-contain"
-                        onError={(e) => ((e.currentTarget as HTMLImageElement).style.opacity = "0.2")}
-                      />
-                      <input
-                        className="border rounded px-2 py-1 w-24"
-                        placeholder="JAX"
-                        value={r.home_team}
-                        onChange={(e) => updateRow(r.id, { home_team: e.target.value })}
-                      />
-                    </div>
-                  </td>
-
-                  <td className="p-2">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <label className="text-xs text-gray-600 flex items-center gap-2">
-                        <input
-                          type="checkbox"
-                          checked={r.is_final}
-                          onChange={(e) => updateRow(r.id, { is_final: e.target.checked })}
+                    <td className="p-2">
+                      <div className="flex items-center gap-2">
+                        <img
+                          src={r.away_team ? logoSrc(r.away_team.trim().toUpperCase()) : ""}
+                          alt=""
+                          className="h-8 w-8 object-contain"
+                          onError={(e) => ((e.currentTarget as HTMLImageElement).style.opacity = "0.2")}
                         />
-                        Final
-                      </label>
+                        <input
+                          className="border rounded px-2 py-1 w-24"
+                          placeholder="BUF"
+                          value={r.away_team}
+                          onChange={(e) => updateRow(r.id, { away_team: e.target.value })}
+                          disabled={disableStructureEdits}
+                          title={
+                            disableStructureEdits
+                              ? "Game is locked. Editing teams is disabled."
+                              : ""
+                          }
+                        />
+                      </div>
+                    </td>
 
-                      <input
-                        className="border rounded px-2 py-1 w-20"
-                        placeholder="Away"
-                        value={r.away_score_final}
-                        onChange={(e) => {
-                          const v = e.target.value;
-                          if (v !== "" && !/^\d{0,2}$/.test(v)) return;
-                          updateRow(r.id, { away_score_final: v });
-                        }}
-                        disabled={!r.is_final}
-                      />
-                      <input
-                        className="border rounded px-2 py-1 w-20"
-                        placeholder="Home"
-                        value={r.home_score_final}
-                        onChange={(e) => {
-                          const v = e.target.value;
-                          if (v !== "" && !/^\d{0,2}$/.test(v)) return;
-                          updateRow(r.id, { home_score_final: v });
-                        }}
-                        disabled={!r.is_final}
-                      />
-                    </div>
-                    {r.is_final && (r.away_score_final === "" || r.home_score_final === "") && (
-                      <div className="text-xs text-red-600 mt-1">Enter both final scores.</div>
-                    )}
-                  </td>
+                    <td className="p-2">
+                      <div className="flex items-center gap-2">
+                        <img
+                          src={r.home_team ? logoSrc(r.home_team.trim().toUpperCase()) : ""}
+                          alt=""
+                          className="h-8 w-8 object-contain"
+                          onError={(e) => ((e.currentTarget as HTMLImageElement).style.opacity = "0.2")}
+                        />
+                        <input
+                          className="border rounded px-2 py-1 w-24"
+                          placeholder="JAX"
+                          value={r.home_team}
+                          onChange={(e) => updateRow(r.id, { home_team: e.target.value })}
+                          disabled={disableStructureEdits}
+                          title={
+                            disableStructureEdits
+                              ? "Game is locked. Editing teams is disabled."
+                              : ""
+                          }
+                        />
+                      </div>
+                    </td>
 
-                  <td className="p-2">
-                    <button
-                      className="border rounded px-3 py-1"
-                      onClick={() => deleteGame(r.id)}
-                      title="Delete game"
-                    >
-                      Delete
-                    </button>
-                  </td>
-                </tr>
-              ))}
+                    <td className="p-2">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <label className="text-xs text-gray-600 flex items-center gap-2">
+                          <input
+                            type="checkbox"
+                            checked={r.is_final}
+                            onChange={(e) => updateRow(r.id, { is_final: e.target.checked })}
+                          />
+                          Final
+                        </label>
+
+                        <input
+                          className="border rounded px-2 py-1 w-20"
+                          placeholder="Away"
+                          value={r.away_score_final}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            if (v !== "" && !/^\d{0,2}$/.test(v)) return;
+                            updateRow(r.id, { away_score_final: v });
+                          }}
+                          disabled={!r.is_final}
+                        />
+                        <input
+                          className="border rounded px-2 py-1 w-20"
+                          placeholder="Home"
+                          value={r.home_score_final}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            if (v !== "" && !/^\d{0,2}$/.test(v)) return;
+                            updateRow(r.id, { home_score_final: v });
+                          }}
+                          disabled={!r.is_final}
+                        />
+                      </div>
+
+                      {r.is_final && (r.away_score_final === "" || r.home_score_final === "") && (
+                        <div className="text-xs text-red-600 mt-1">Enter both final scores.</div>
+                      )}
+                    </td>
+
+                    <td className="p-2">
+                      <button
+                        className="border rounded px-3 py-1 disabled:opacity-50"
+                        onClick={() => deleteGame(r.id)}
+                        disabled={!isNewId(r.id) && locked}
+                        title={
+                          !isNewId(r.id) && locked
+                            ? "Locked game can't be deleted."
+                            : "Delete game"
+                        }
+                      >
+                        Delete
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
 
               {rows.length === 0 && (
                 <tr className="border-t">
-                  <td className="p-4 text-sm text-gray-600" colSpan={5}>
+                  <td className="p-4 text-sm text-gray-600" colSpan={6}>
                     No games yet. Click “Add Game”.
                   </td>
                 </tr>

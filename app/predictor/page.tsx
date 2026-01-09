@@ -9,7 +9,7 @@ type Round = {
   name: string;
   round_number: number;
   is_current: boolean;
-  predictor_locked: boolean;
+  predictor_locked: boolean; // keep for legacy / optional display, but locking is now per-game
 };
 
 type PredictorGame = {
@@ -61,6 +61,13 @@ function formatKickoff(ts: string | null) {
   }
 }
 
+function isGameLocked(kickoffAt: string | null) {
+  if (!kickoffAt) return false; // if missing kickoff, treat as unlocked
+  const t = new Date(kickoffAt).getTime();
+  if (!Number.isFinite(t)) return false;
+  return t <= Date.now();
+}
+
 // --- round persistence helpers ---
 function safeGetLS(key: string) {
   try {
@@ -81,7 +88,7 @@ function pickDefaultRoundId(rounds: Round[], storageKey: string) {
   const saved = typeof window !== "undefined" ? safeGetLS(storageKey) : null;
   if (saved && rounds.some((r) => String(r.id) === String(saved))) return String(saved);
 
-  // B) most recent predictor_locked (highest round_number)
+  // B) most recent predictor_locked (highest round_number) (legacy behavior)
   const locked = rounds
     .filter((r) => r.predictor_locked)
     .sort((a, b) => (Number(b.round_number) || 0) - (Number(a.round_number) || 0));
@@ -110,14 +117,13 @@ export default function PredictorPage() {
   const [picks, setPicks] = useState<Record<string, PickState>>({});
   const [initialPicks, setInitialPicks] = useState<Record<string, PickState>>({});
 
+  // points map (only meaningful when finals exist + admin recalculated; displayed per-game if game locked)
   const [pointsByGameId, setPointsByGameId] = useState<Record<string, PredictorPointRow>>({});
 
   const selectedRound = useMemo(
     () => rounds.find((r) => String(r.id) === String(selectedRoundId)) ?? null,
     [rounds, selectedRoundId]
   );
-
-  const predictorLocked = selectedRound?.predictor_locked ?? false;
 
   const roundStorageKey = "predictor_round";
 
@@ -166,6 +172,7 @@ export default function PredictorPage() {
     setError(null);
     setStatusMsg(null);
 
+    // 1) games
     const { data: gamesData, error: gamesError } = await supabase
       .from("predictor_games")
       .select("id, round_id, kickoff_at, away_team, home_team, away_score_final, home_score_final, is_final")
@@ -189,6 +196,7 @@ export default function PredictorPage() {
 
     const gameIds = g.map((x) => x.id);
 
+    // 2) entries (owner can always read; RLS may restrict for non-owner pages)
     const { data: entriesData, error: entriesError } = await supabase
       .from("predictor_entries")
       .select("id, game_id, user_id, away_score_pred, home_score_pred")
@@ -214,6 +222,7 @@ export default function PredictorPage() {
     setPicks(pickMap);
     setInitialPicks(pickMap);
 
+    // 3) points (safe to load; may be empty until calculated)
     const { data: ptsData, error: ptsError } = await supabase
       .from("predictor_points")
       .select("game_id, user_id, base_points, weighted_points")
@@ -241,6 +250,7 @@ export default function PredictorPage() {
   const dirtyCount = useMemo(() => {
     let c = 0;
     for (const game of games) {
+      if (isGameLocked(game.kickoff_at)) continue; // locked games don't count as editable changes
       const a = picks[game.id];
       const b = initialPicks[game.id];
       if (!a || !b) continue;
@@ -251,6 +261,7 @@ export default function PredictorPage() {
 
   const hasAnyInvalid = useMemo(() => {
     for (const game of games) {
+      if (isGameLocked(game.kickoff_at)) continue; // ignore locked games (they can't be saved anyway)
       const p = picks[game.id];
       if (!p) continue;
 
@@ -275,6 +286,7 @@ export default function PredictorPage() {
     setStatusMsg(null);
     setError(null);
 
+    // allow empty, otherwise only digits (0-99)
     if (val !== "" && !/^\d{0,2}$/.test(val)) return;
 
     setPicks((prev) => ({
@@ -288,7 +300,6 @@ export default function PredictorPage() {
 
   async function saveAll() {
     if (!userId) return;
-    if (predictorLocked) return;
 
     setError(null);
     setStatusMsg(null);
@@ -298,6 +309,7 @@ export default function PredictorPage() {
       return;
     }
 
+    // Only submit picks for UNLOCKED games
     const upserts: {
       game_id: string;
       user_id: string;
@@ -306,6 +318,8 @@ export default function PredictorPage() {
     }[] = [];
 
     for (const game of games) {
+      if (isGameLocked(game.kickoff_at)) continue;
+
       const p = picks[game.id];
       if (!p) continue;
 
@@ -321,21 +335,32 @@ export default function PredictorPage() {
       });
     }
 
-    setSaving(true);
-
-    if (upserts.length > 0) {
-      const { error: upsertError } = await supabase
-        .from("predictor_entries")
-        .upsert(upserts, { onConflict: "game_id,user_id" });
-
-      if (upsertError) {
-        setSaving(false);
-        setError(upsertError.message);
-        return;
-      }
+    if (upserts.length === 0) {
+      setStatusMsg("Nothing to save (all editable games are blank or locked).");
+      return;
     }
 
-    setInitialPicks(picks);
+    setSaving(true);
+
+    const { error: upsertError } = await supabase
+      .from("predictor_entries")
+      .upsert(upserts, { onConflict: "game_id,user_id" });
+
+    if (upsertError) {
+      setSaving(false);
+      setError(upsertError.message);
+      return;
+    }
+
+    // Update initialPicks ONLY for games we actually saved
+    setInitialPicks((prev) => {
+      const next = { ...prev };
+      for (const u of upserts) {
+        next[u.game_id] = { away: String(u.away_score_pred), home: String(u.home_score_pred) };
+      }
+      return next;
+    });
+
     setSaving(false);
     setStatusMsg("Saved.");
   }
@@ -361,6 +386,8 @@ export default function PredictorPage() {
     );
   }
 
+  const editableGamesCount = games.filter((g) => !isGameLocked(g.kickoff_at)).length;
+
   return (
     <div>
       <NavBar />
@@ -369,19 +396,22 @@ export default function PredictorPage() {
         <div className="flex items-end justify-between gap-4 flex-wrap">
           <div className="space-y-1">
             <h1 className="text-2xl font-semibold">Game Predictor</h1>
+
+            {/* ⚠️ MONEY WARNING */}
             <div className="mt-2 border border-red-300 bg-red-50 text-red-800 rounded p-3 text-sm">
-            <div className="font-semibold mb-1">⚠️ Money Game</div>
-            <div>
+              <div className="font-semibold mb-1">⚠️ Money Game</div>
+              <div>
                 This page is for <span className="font-semibold">real money tracking</span> within our friend group.
                 <br />
                 <span className="font-semibold">Only play if you are willing to pay.</span>
                 If you are not interested in gambling, <span className="underline">do not submit picks</span> on this page.
+              </div>
             </div>
-            </div>
-            <p className="mt-2 text-sm text-gray-600">
-            Make picks for any round. Results & points appear after the round is locked.
-            </p>
 
+            <p className="mt-2 text-sm text-gray-600">
+              Picks lock <span className="font-semibold">per game at kickoff</span>. Results & points appear after kickoff
+              once the final score is entered and the admin recalculates points.
+            </p>
           </div>
 
           <div className="flex items-end gap-3 flex-wrap">
@@ -399,7 +429,6 @@ export default function PredictorPage() {
                   <option key={r.id} value={r.id}>
                     {r.round_number}. {r.name}
                     {r.is_current ? " (Current)" : ""}
-                    {r.predictor_locked ? " (Locked)" : ""}
                   </option>
                 ))}
               </select>
@@ -407,11 +436,11 @@ export default function PredictorPage() {
 
             <button
               onClick={saveAll}
-              disabled={predictorLocked || saving || dirtyCount === 0 || hasAnyInvalid}
+              disabled={saving || dirtyCount === 0 || hasAnyInvalid || editableGamesCount === 0}
               className="bg-black text-white rounded px-4 py-2 disabled:opacity-50"
               title={
-                predictorLocked
-                  ? "This round is locked."
+                editableGamesCount === 0
+                  ? "All games are locked for this round."
                   : hasAnyInvalid
                   ? "Fix invalid picks first."
                   : dirtyCount === 0
@@ -422,24 +451,20 @@ export default function PredictorPage() {
               {saving ? "Saving..." : "Save Predictions"}
             </button>
 
-            {!predictorLocked && dirtyCount > 0 && <span className="text-xs text-gray-600">{dirtyCount} unsaved</span>}
+            {dirtyCount > 0 && <span className="text-xs text-gray-600">{dirtyCount} unsaved</span>}
           </div>
         </div>
 
         {selectedRound ? (
           <div className="text-sm text-gray-600">
-            Viewing: <span className="font-semibold">{selectedRound.name}</span>{" "}
-            {predictorLocked ? (
-              <span className="ml-2 text-red-700 font-semibold">(Locked)</span>
-            ) : (
-              <span className="ml-2">(Open)</span>
-            )}
+            Viewing: <span className="font-semibold">{selectedRound.name}</span>
           </div>
         ) : null}
 
         {error && <div className="text-sm text-red-600">{error}</div>}
         {statusMsg && <div className="text-sm text-green-700">{statusMsg}</div>}
 
+        {/* Compact grid to fit 6 games */}
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
           {games.map((g) => {
             const p = picks[g.id] ?? { away: "", home: "" };
@@ -448,7 +473,10 @@ export default function PredictorPage() {
             const homeEmpty = p.home.trim() === "";
             const partial = awayEmpty !== homeEmpty;
 
-            const showResults = predictorLocked;
+            const gameLocked = isGameLocked(g.kickoff_at);
+
+            // show results after kickoff (per-game)
+            const showResults = gameLocked;
 
             const finalReady = g.is_final && g.away_score_final != null && g.home_score_final != null;
 
@@ -460,12 +488,22 @@ export default function PredictorPage() {
                 <div className="flex items-start justify-between gap-2">
                   <div className="text-[11px] text-gray-600 leading-tight">{formatKickoff(g.kickoff_at)}</div>
 
-                  {showResults && finalReady ? (
-                    <span className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-700">Final</span>
-                  ) : null}
+                  <div className="flex items-center gap-2">
+                    {gameLocked ? (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-gray-900 text-white">Locked</span>
+                    ) : (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-700">Open</span>
+                    )}
+
+                    {showResults && finalReady ? (
+                      <span className="text-[10px] px-2 py-0.5 rounded bg-gray-100 text-gray-700">Final</span>
+                    ) : null}
+                  </div>
                 </div>
 
+                {/* Matchup */}
                 <div className="mt-2 grid grid-cols-3 items-center gap-2">
+                  {/* Away */}
                   <div className="flex flex-col items-center gap-1">
                     <img
                       src={logoSrc(g.away_team)}
@@ -483,11 +521,12 @@ export default function PredictorPage() {
                       pattern="\d*"
                       placeholder="-"
                       value={p.away}
-                      disabled={predictorLocked}
+                      disabled={gameLocked}
                       onChange={(e) => setPick(g.id, "away", e.target.value)}
                     />
                   </div>
 
+                  {/* Center */}
                   <div className="flex flex-col items-center justify-center">
                     <div className="text-xs text-gray-500 font-semibold">@</div>
 
@@ -498,9 +537,12 @@ export default function PredictorPage() {
                           {g.away_score_final}-{g.home_score_final}
                         </div>
                       </div>
+                    ) : showResults ? (
+                      <div className="mt-1 text-[11px] text-gray-500 text-center">Final not entered</div>
                     ) : null}
                   </div>
 
+                  {/* Home */}
                   <div className="flex flex-col items-center gap-1">
                     <img
                       src={logoSrc(g.home_team)}
@@ -518,22 +560,28 @@ export default function PredictorPage() {
                       pattern="\d*"
                       placeholder="-"
                       value={p.home}
-                      disabled={predictorLocked}
+                      disabled={gameLocked}
                       onChange={(e) => setPick(g.id, "home", e.target.value)}
                     />
                   </div>
                 </div>
 
-                {partial && !predictorLocked && (
-                  <div className="mt-2 text-[11px] text-red-600 text-center">Enter both scores (or leave both blank).</div>
+                {/* Validation note (only when game is open) */}
+                {partial && !gameLocked && (
+                  <div className="mt-2 text-[11px] text-red-600 text-center">
+                    Enter both scores (or leave both blank).
+                  </div>
                 )}
 
+                {/* Points awarded (only after kickoff) */}
                 {showResults ? (
                   <div className="mt-2 text-center">
                     {!finalReady ? (
                       <div className="text-[11px] text-gray-500">Final score not entered yet.</div>
                     ) : awarded == null ? (
-                      <div className="text-[11px] text-gray-500">Points not calculated yet (admin needs to Recalculate).</div>
+                      <div className="text-[11px] text-gray-500">
+                        Points not calculated yet (admin needs to Recalculate).
+                      </div>
                     ) : (
                       <div className="text-sm">
                         <span className="text-gray-600">Points:</span>{" "}
@@ -541,7 +589,11 @@ export default function PredictorPage() {
                       </div>
                     )}
                   </div>
-                ) : null}
+                ) : (
+                  <div className="mt-2 text-center text-[11px] text-gray-500">
+                    This game locks at kickoff.
+                  </div>
+                )}
               </div>
             );
           })}

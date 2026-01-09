@@ -136,6 +136,12 @@ export default function MyTeamPage() {
 
   const roundStorageKey = "myteam_round";
 
+  // ✅ Buy-in popup state
+  const [buyInAmount, setBuyInAmount] = useState<number | null>(null);
+  const [showBuyInModal, setShowBuyInModal] = useState(false);
+  const [buyInInput, setBuyInInput] = useState<string>("0");
+  const [pendingSaveAfterBuyIn, setPendingSaveAfterBuyIn] = useState(false);
+
   useEffect(() => {
     async function loadInitial() {
       setError(null);
@@ -148,19 +154,28 @@ export default function MyTeamPage() {
 
       setUserId(userData.user.id);
 
-      const [{ data: roundsData, error: roundsError }, { data: playersData, error: playersError }] =
-        await Promise.all([
-          supabase
-            .from("rounds")
-            .select("id, name, round_number, is_locked, is_current")
-            .order("round_number", { ascending: true }),
-          supabase.from("players").select("id, name, team, position, espn_id").order("name", { ascending: true }),
-        ]);
+      const [
+        { data: roundsData, error: roundsError },
+        { data: playersData, error: playersError },
+        { data: meData, error: meError },
+      ] = await Promise.all([
+        supabase
+          .from("rounds")
+          .select("id, name, round_number, is_locked, is_current")
+          .order("round_number", { ascending: true }),
+        supabase.from("players").select("id, name, team, position, espn_id").order("name", { ascending: true }),
+        supabase.from("users").select("buy_in_amount").eq("id", userData.user.id).maybeSingle(),
+      ]);
 
       setLoading(false);
 
       if (roundsError) return setError(roundsError.message);
       if (playersError) return setError(playersError.message);
+      if (meError) return setError(meError.message);
+
+      // ✅ store buy-in (null means not answered yet)
+      const amt = meData?.buy_in_amount;
+      setBuyInAmount(amt == null ? null : Number(amt));
 
       const r = (roundsData ?? []) as Round[];
       const p = (playersData ?? []) as Player[];
@@ -294,7 +309,8 @@ export default function MyTeamPage() {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  async function saveLineup() {
+  // ✅ Extracted "real save"
+  async function actuallySaveLineup() {
     setError(null);
     setStatusMsg(null);
 
@@ -325,6 +341,56 @@ export default function MyTeamPage() {
     }
 
     setStatusMsg("Saved!");
+  }
+
+  // ✅ Save buy-in via RPC, then continue save if needed
+  async function saveBuyInThenContinue() {
+    setError(null);
+    setStatusMsg(null);
+
+    const amt = buyInInput.trim() === "" ? 0 : Number(buyInInput);
+
+    if (!Number.isFinite(amt) || amt < 0) {
+      setError("Buy-in must be a number ≥ 0.");
+      return;
+    }
+
+    const { error: rpcErr } = await supabase.rpc("set_buy_in_amount", { p_amount: amt });
+    if (rpcErr) {
+      setError(rpcErr.message);
+      return;
+    }
+
+    setBuyInAmount(amt);
+    setShowBuyInModal(false);
+
+    if (pendingSaveAfterBuyIn) {
+      setPendingSaveAfterBuyIn(false);
+      await actuallySaveLineup();
+    }
+  }
+
+  // ✅ Gate save: only show popup once, only on Wild Card (round_number === 1)
+  async function saveLineup() {
+    setError(null);
+    setStatusMsg(null);
+
+    if (isLocked) {
+      setError("This round is locked. You can’t save changes.");
+      return;
+    }
+
+    const isWildCard = selectedRound?.round_number === 1;
+
+    // show modal only the first time ever (buy_in_amount is null)
+    if (isWildCard && buyInAmount == null) {
+      setBuyInInput("0");
+      setPendingSaveAfterBuyIn(true);
+      setShowBuyInModal(true);
+      return;
+    }
+
+    await actuallySaveLineup();
   }
 
   if (loading) {
@@ -431,7 +497,9 @@ export default function MyTeamPage() {
                       <div className="w-14 h-14 rounded-full bg-white border flex items-center justify-center text-lg font-semibold">
                         {p ? (p.position === "DEF" ? p.team : initials(p.name)) : s.label}
                       </div>
-                      <div className="mt-2 text-xs">{p ? (p.position === "DEF" ? "Defense" : "No photo") : "Empty"}</div>
+                      <div className="mt-2 text-xs">
+                        {p ? (p.position === "DEF" ? "Defense" : "No photo") : "Empty"}
+                      </div>
                     </div>
                   )}
 
@@ -467,7 +535,9 @@ export default function MyTeamPage() {
                     <div className="font-semibold leading-tight">
                       {p ? p.name : <span className="text-gray-500">No player selected</span>}
                     </div>
-                    <div className="text-xs text-gray-600">{p ? `${p.team} — ${p.position}` : `Select an eligible ${s.label}`}</div>
+                    <div className="text-xs text-gray-600">
+                      {p ? `${p.team} — ${p.position}` : `Select an eligible ${s.label}`}
+                    </div>
                   </div>
 
                   {!isLocked && (
@@ -493,7 +563,9 @@ export default function MyTeamPage() {
                       </div>
 
                       {score && mult > 1 && (
-                        <div className="text-[11px] text-gray-500 mt-1 tabular-nums">Total {(totalPts ?? 0).toFixed(1)}</div>
+                        <div className="text-[11px] text-gray-500 mt-1 tabular-nums">
+                          Total {(totalPts ?? 0).toFixed(1)}
+                        </div>
                       )}
                     </div>
                   )}
@@ -505,6 +577,50 @@ export default function MyTeamPage() {
 
         <div className="text-xs text-gray-500">Tip: Players can only be selected once per lineup (including FLEX).</div>
       </div>
+
+      {/* ✅ BUY-IN MODAL (only shown once, only on first Wild Card save) */}
+      {showBuyInModal && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
+          <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-lg">
+            <div className="text-lg font-semibold">Buy-in (Winner take all)</div>
+            <div className="mt-2 text-sm text-gray-600">
+              How much are you willing to buy in for? Winner take all.{" "}
+              <span className="font-semibold">Enter 0 if you don’t want to buy in</span> (you can still play).
+            </div>
+
+            <div className="mt-4">
+              <label className="text-xs text-gray-600">Amount</label>
+              <div className="mt-1 flex items-center gap-2">
+                <span className="text-sm">$</span>
+                <input
+                  className="w-full border rounded px-3 py-2"
+                  type="number"
+                  min="0"
+                  step="1"
+                  inputMode="decimal"
+                  value={buyInInput}
+                  onChange={(e) => setBuyInInput(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 flex justify-end gap-2">
+              <button
+                className="border rounded px-4 py-2"
+                onClick={() => {
+                  setPendingSaveAfterBuyIn(false);
+                  setShowBuyInModal(false);
+                }}
+              >
+                Cancel
+              </button>
+              <button className="bg-black text-white rounded px-4 py-2" onClick={saveBuyInThenContinue}>
+                Submit & Save
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
