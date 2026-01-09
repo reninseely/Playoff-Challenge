@@ -38,15 +38,24 @@ export default function NavBar() {
           <a href="/my-team" className="font-semibold">
             Playoff Challenge
           </a>
+
           <a href="/my-team" className="text-sm underline">
             My Team
           </a>
+
+          {/* NEW */}
+          <a href="/predictor" className="text-sm underline">
+            Predictor
+          </a>
+
           <a href="/leaderboard" className="text-sm underline">
             Leaderboard
           </a>
+
           <a href="/rules" className="text-sm underline">
             Rules
           </a>
+
           {profile?.is_admin ? (
             <a href="/admin" className="text-sm underline">
               Admin

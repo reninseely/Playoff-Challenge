@@ -76,6 +76,40 @@ function computeMultiplier(base: number, total: number) {
   return rounded;
 }
 
+// --- round persistence helpers ---
+function safeGetLS(key: string) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function safeSetLS(key: string, value: string) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {}
+}
+
+function pickDefaultRoundId(rounds: Round[], storageKey: string) {
+  // A) saved selection wins if valid
+  const saved = typeof window !== "undefined" ? safeGetLS(storageKey) : null;
+  if (saved && rounds.some((r) => String(r.id) === String(saved))) return String(saved);
+
+  // B) most recent locked (highest round_number)
+  const locked = rounds
+    .filter((r) => r.is_locked)
+    .sort((a, b) => (Number(b.round_number) || 0) - (Number(a.round_number) || 0));
+  if (locked.length > 0) return String(locked[0].id);
+
+  // fallback: current
+  const current = rounds.find((r) => r.is_current);
+  if (current) return String(current.id);
+
+  // fallback: first
+  return rounds[0] ? String(rounds[0].id) : "";
+}
+
 export default function TeamViewPage() {
   const params = useParams<{ username: string }>();
   const usernameParam = params?.username ?? "";
@@ -98,6 +132,12 @@ export default function TeamViewPage() {
 
   const [scoresBySlot, setScoresBySlot] = useState<Map<string, ScoreRow>>(new Map());
   const [roundLoading, setRoundLoading] = useState(false);
+
+  // storage key should be stable per viewed username
+  const roundStorageKey = useMemo(
+    () => `team_round_${encodeURIComponent(String(usernameParam).trim().toLowerCase())}`,
+    [usernameParam]
+  );
 
   useEffect(() => {
     async function loadInitial() {
@@ -122,8 +162,12 @@ export default function TeamViewPage() {
 
       const r = (roundsData ?? []) as Round[];
       setRounds(r);
-      const current = r.find((x) => x.is_current);
-      setSelectedRoundId(String((current ?? r[0]).id));
+
+      if (r.length > 0) {
+        setSelectedRoundId(pickDefaultRoundId(r, roundStorageKey));
+      } else {
+        setSelectedRoundId("");
+      }
 
       const { data: userRow, error: userError } = await supabase
         .from("users")
@@ -166,7 +210,7 @@ export default function TeamViewPage() {
     }
 
     loadInitial();
-  }, [usernameParam]);
+  }, [usernameParam, roundStorageKey]);
 
   const selectedRound = useMemo(
     () => rounds.find((r) => String(r.id) === String(selectedRoundId)),
@@ -278,7 +322,6 @@ export default function TeamViewPage() {
       <NavBar />
 
       <div className="p-6 space-y-6 max-w-5xl mx-auto">
-        {/* Header (same vibe as My Team page) */}
         <div className="flex items-end justify-between gap-4 flex-wrap">
           <div className="space-y-1">
             <h1 className="text-2xl font-semibold">{viewedUsername}</h1>
@@ -297,7 +340,10 @@ export default function TeamViewPage() {
               <select
                 className="border rounded px-3 py-2"
                 value={selectedRoundId}
-                onChange={(e) => setSelectedRoundId(e.target.value)}
+                onChange={(e) => {
+                  setSelectedRoundId(e.target.value);
+                  safeSetLS(roundStorageKey, e.target.value);
+                }}
               >
                 {rounds.map((r) => (
                   <option key={String(r.id)} value={String(r.id)}>
@@ -317,7 +363,6 @@ export default function TeamViewPage() {
           </div>
         ) : (
           <>
-            {/* Grid (copies My Team UI, but read-only) */}
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
               {SLOTS.map((s) => {
                 const pid = lineupBySlot[s.key];
@@ -335,7 +380,6 @@ export default function TeamViewPage() {
 
                 return (
                   <div key={s.key} className="border rounded-xl overflow-hidden bg-white shadow-sm">
-                    {/* Image area */}
                     <div className="relative h-36 bg-gray-100 flex items-center justify-center overflow-hidden">
                       {img ? (
                         // eslint-disable-next-line @next/next/no-img-element
@@ -358,14 +402,12 @@ export default function TeamViewPage() {
                         </div>
                       )}
 
-                      {/* Slot badge */}
                       <div className="absolute top-3 left-3">
                         <span className="text-xs font-semibold bg-white/90 border rounded-full px-2 py-1">
                           {s.label}
                         </span>
                       </div>
 
-                      {/* Team logo (top-right) */}
                       {p && (
                         <div className="absolute top-3 right-3">
                           <div className="w-10 h-10 rounded-xl bg-white/95 border shadow-sm flex items-center justify-center overflow-hidden">
@@ -379,7 +421,6 @@ export default function TeamViewPage() {
                         </div>
                       )}
 
-                      {/* Multiplier (bottom-right in gray area) */}
                       {showMult && (
                         <div className="absolute bottom-3 right-3">
                           <div className="text-2xl font-extrabold text-blue-600 leading-none drop-shadow-sm">
@@ -389,9 +430,7 @@ export default function TeamViewPage() {
                       )}
                     </div>
 
-                    {/* Content */}
                     <div className="relative p-4 space-y-3">
-                      {/* Name + team */}
                       <div className="space-y-1 pr-20">
                         <div className="font-semibold leading-tight">
                           {p ? p.name : <span className="text-gray-500">No player selected</span>}
@@ -401,7 +440,6 @@ export default function TeamViewPage() {
                         </div>
                       </div>
 
-                      {/* Points (bottom-right) */}
                       <div className="absolute right-4 bottom-4 text-right">
                         <div className="text-2xl font-extrabold text-black leading-none tabular-nums">
                           {(score ? basePts : 0).toFixed(1)}

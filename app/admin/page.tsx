@@ -97,33 +97,26 @@ export default function AdminPage() {
         </div>
 
         <div className="grid gap-3">
-          <a
-            href="/admin/players"
-            className="border rounded p-4 hover:bg-gray-50"
-          >
+          <a href="/admin/players" className="border rounded p-4 hover:bg-gray-50">
             <div className="font-semibold">Player Seeding</div>
-            <div className="text-sm text-gray-600">
-              Import or paste players into the system.
-            </div>
+            <div className="text-sm text-gray-600">Import or paste players into the system.</div>
           </a>
 
-          <a
-            href="/admin/stats"
-            className="border rounded p-4 hover:bg-gray-50"
-          >
+          <a href="/admin/stats" className="border rounded p-4 hover:bg-gray-50">
             <div className="font-semibold">Stats Upload</div>
-            <div className="text-sm text-gray-600">
-              Paste fantasy-point CSV for a round.
-            </div>
+            <div className="text-sm text-gray-600">Paste fantasy-point CSV for a round.</div>
           </a>
 
-          <a
-            href="/admin/rounds"
-            className="border rounded p-4 hover:bg-gray-50"
-          >
+          <a href="/admin/rounds" className="border rounded p-4 hover:bg-gray-50">
             <div className="font-semibold">Round Controls</div>
+            <div className="text-sm text-gray-600">Lock or unlock playoff rounds.</div>
+          </a>
+
+          {/* NEW */}
+          <a href="/admin/predictor" className="border rounded p-4 hover:bg-gray-50">
+            <div className="font-semibold">Game Predictor</div>
             <div className="text-sm text-gray-600">
-              Lock or unlock playoff rounds.
+              Add matchups, enter final scores, and calculate predictor points.
             </div>
           </a>
         </div>
