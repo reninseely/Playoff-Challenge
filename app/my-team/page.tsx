@@ -57,9 +57,13 @@ type ScoreRow = {
 
 function headshotUrl(p: Player) {
   if (!p.espn_id) return null;
-  // Only players have headshots; DEF we’ll keep placeholder for now
-  if (p.position === "DEF") return null;
+  if (p.position === "DEF") return null; // DEF uses local logos
   return `https://a.espncdn.com/i/headshots/nfl/players/full/${p.espn_id}.png`;
+}
+
+function defenseLogoUrl(teamAbbr: string) {
+  // expects files like: public/defenses/PIT.png
+  return `/defenses/${teamAbbr.toUpperCase()}.png`;
 }
 
 function initials(name: string) {
@@ -67,6 +71,15 @@ function initials(name: string) {
   const a = parts[0]?.[0] ?? "";
   const b = parts.length > 1 ? parts[parts.length - 1]?.[0] ?? "" : "";
   return (a + b).toUpperCase();
+}
+
+function computeMultiplier(base: number, total: number) {
+  if (!base || base === 0) return 1;
+  const raw = total / base;
+  const rounded = Math.round(raw);
+  if (!Number.isFinite(rounded) || rounded < 1) return 1;
+  if (rounded > 6) return 6; // safety clamp
+  return rounded;
 }
 
 export default function MyTeamPage() {
@@ -143,7 +156,6 @@ export default function MyTeamPage() {
 
   const isLocked = selectedRound?.is_locked ?? false;
 
-  // Load roster + roster_players whenever userId + selectedRoundId changes
   useEffect(() => {
     async function loadRosterForRound() {
       if (!userId || !selectedRoundId) return;
@@ -205,7 +217,6 @@ export default function MyTeamPage() {
       }
       setLineup(next);
 
-      // If locked, also load base + total points by slot
       if (isLocked) {
         const { data: scoreRows, error: scoreError } = await supabase
           .from("roster_spot_scores")
@@ -363,22 +374,24 @@ export default function MyTeamPage() {
             const score = scoresBySlot.get(String(s.key));
 
             const img = p ? headshotUrl(p) : null;
+            const showDefLogo = !!p && p.position === "DEF";
+            const logo = p ? defenseLogoUrl(p.team) : null;
+
+            const basePts = score?.base_points ?? 0;
+            const totalPts = score?.multiplied_points ?? 0;
+            const mult = computeMultiplier(basePts, totalPts);
+            const showMult = isLocked && score && mult > 1;
 
             return (
-              <div
-                key={s.key}
-                className="border rounded-xl overflow-hidden bg-white shadow-sm"
-              >
+              <div key={s.key} className="border rounded-xl overflow-hidden bg-white shadow-sm">
                 {/* Image area */}
-                <div className="relative h-36 bg-gray-100 flex items-center justify-center">
+                <div className="relative h-36 bg-gray-100 flex items-center justify-center overflow-hidden">
                   {img ? (
-                    // eslint-disable-next-line @next/next/no-img-element
                     <img
                       src={img}
                       alt={p?.name ?? "Player"}
-                      className="h-full w-full object-cover"
+                      className="h-full w-full object-contain bg-gray-100"
                       onError={(e) => {
-                        // fallback if ESPN image fails
                         (e.currentTarget as HTMLImageElement).style.display = "none";
                       }}
                     />
@@ -387,7 +400,9 @@ export default function MyTeamPage() {
                       <div className="w-14 h-14 rounded-full bg-white border flex items-center justify-center text-lg font-semibold">
                         {p ? (p.position === "DEF" ? p.team : initials(p.name)) : s.label}
                       </div>
-                      <div className="mt-2 text-xs">{p ? (p.position === "DEF" ? "Defense" : "No photo") : "Empty"}</div>
+                      <div className="mt-2 text-xs">
+                        {p ? (p.position === "DEF" ? "Defense" : "No photo") : "Empty"}
+                      </div>
                     </div>
                   )}
 
@@ -398,30 +413,39 @@ export default function MyTeamPage() {
                     </span>
                   </div>
 
-                  {/* Locked badge */}
-                  {isLocked && (
+                  {/* Team logo (top-right) */}
+                  {p && (
                     <div className="absolute top-3 right-3">
-                      <span className="text-xs font-semibold bg-red-600 text-white rounded-full px-2 py-1">
-                        Locked
-                      </span>
+                      <div className="w-10 h-10 rounded-xl bg-white/95 border shadow-sm flex items-center justify-center overflow-hidden">
+                        {showDefLogo ? (
+                          <img src={logo!} alt={`${p.team} logo`} className="w-full h-full object-contain p-1" />
+                        ) : (
+                          <img
+                            src={defenseLogoUrl(p.team)}
+                            alt={`${p.team} logo`}
+                            className="w-full h-full object-contain p-1"
+                          />
+                        )}
+                      </div>
+                    </div>
+                  )}
+
+                  {/* ✅ MULTIPLIER: moved into the gray area, bottom-right */}
+                  {showMult && (
+                    <div className="absolute bottom-3 right-3">
+                      <div className="text-2xl font-extrabold text-blue-600 leading-none drop-shadow-sm">
+                        x{mult}
+                      </div>
                     </div>
                   )}
                 </div>
 
                 {/* Content */}
-                <div className="p-4 space-y-3">
+                <div className="relative p-4 space-y-3">
                   {/* Name + team */}
-                  <div className="space-y-1">
+                  <div className="space-y-1 pr-20">
                     <div className="font-semibold leading-tight">
-                      {p ? (
-                        p.position === "DEF" ? (
-                          `${p.name}`
-                        ) : (
-                          p.name
-                        )
-                      ) : (
-                        <span className="text-gray-500">No player selected</span>
-                      )}
+                      {p ? p.name : <span className="text-gray-500">No player selected</span>}
                     </div>
                     <div className="text-xs text-gray-600">
                       {p ? `${p.team} — ${p.position}` : `Select an eligible ${s.label}`}
@@ -444,21 +468,21 @@ export default function MyTeamPage() {
                     </select>
                   )}
 
-                  {/* Scores (only when locked) */}
+                  {/* Locked scoring display */}
                   {isLocked && (
-                    <div className="grid grid-cols-2 gap-3">
-                      <div className="border rounded-lg p-2">
-                        <div className="text-[11px] text-gray-500">Base</div>
-                        <div className="font-semibold tabular-nums">
-                          {score ? score.base_points.toFixed(1) : "0.0"}
-                        </div>
+                    <div className="absolute right-4 bottom-4 text-right">
+                      {/* ✅ POINTS: changed to black */}
+                      <div className="text-2xl font-extrabold text-black leading-none tabular-nums">
+                        {(score ? basePts : 0).toFixed(1)}
+                        <span className="text-base font-bold ml-1">pts</span>
                       </div>
-                      <div className="border rounded-lg p-2">
-                        <div className="text-[11px] text-gray-500">Total</div>
-                        <div className="font-semibold tabular-nums">
-                          {score ? score.multiplied_points.toFixed(1) : "0.0"}
+
+                      {/* optional tiny total line */}
+                      {score && mult > 1 && (
+                        <div className="text-[11px] text-gray-500 mt-1 tabular-nums">
+                          Total {(totalPts ?? 0).toFixed(1)}
                         </div>
-                      </div>
+                      )}
                     </div>
                   )}
                 </div>
@@ -467,10 +491,7 @@ export default function MyTeamPage() {
           })}
         </div>
 
-        {/* Tiny helper footer */}
-        <div className="text-xs text-gray-500">
-          Tip: Players can only be selected once per lineup (including FLEX).
-        </div>
+        <div className="text-xs text-gray-500">Tip: Players can only be selected once per lineup (including FLEX).</div>
       </div>
     </div>
   );
