@@ -358,9 +358,7 @@ export default function TeamViewPage() {
         {roundLoading && <div className="text-sm text-gray-600">Loading round...</div>}
 
         {!isLocked ? (
-          <div className="border rounded p-4 bg-gray-50 text-sm">
-            This round isn’t locked yet.
-          </div>
+          <div className="border rounded p-4 bg-gray-50 text-sm">This round isn’t locked yet.</div>
         ) : (
           <>
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
@@ -370,6 +368,9 @@ export default function TeamViewPage() {
                 const score = scoresBySlot.get(String(s.key));
 
                 const img = p ? headshotUrl(p) : null;
+                const isDef = !!p && p.position === "DEF";
+                const defLogo = isDef ? defenseLogoUrl(p.team) : null;
+
                 const showDefLogo = !!p && p.position === "DEF";
                 const teamLogo = p ? defenseLogoUrl(p.team) : null;
 
@@ -391,14 +392,23 @@ export default function TeamViewPage() {
                             (e.currentTarget as HTMLImageElement).style.display = "none";
                           }}
                         />
+                      ) : isDef ? (
+                        // ✅ DEF main image uses logo (like a headshot)
+                        // eslint-disable-next-line @next/next/no-img-element
+                        <img
+                          src={defLogo!}
+                          alt={`${p.team} defense`}
+                          className="h-full w-full object-contain p-6 bg-gray-100"
+                          onError={(e) => {
+                            (e.currentTarget as HTMLImageElement).style.opacity = "0.2";
+                          }}
+                        />
                       ) : (
                         <div className="flex flex-col items-center justify-center text-gray-500">
                           <div className="w-14 h-14 rounded-full bg-white border flex items-center justify-center text-lg font-semibold">
-                            {p ? (p.position === "DEF" ? p.team : initials(p.name)) : s.label}
+                            {p ? initials(p.name) : s.label}
                           </div>
-                          <div className="mt-2 text-xs">
-                            {p ? (p.position === "DEF" ? "Defense" : "No photo") : "Empty"}
-                          </div>
+                          <div className="mt-2 text-xs">{p ? "No photo" : "Empty"}</div>
                         </div>
                       )}
 
