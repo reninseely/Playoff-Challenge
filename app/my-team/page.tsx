@@ -97,21 +97,17 @@ function safeSetLS(key: string, value: string) {
 }
 
 function pickDefaultRoundId(rounds: Round[], storageKey: string) {
-  // A) saved selection wins if valid
   const saved = typeof window !== "undefined" ? safeGetLS(storageKey) : null;
   if (saved && rounds.some((r) => String(r.id) === String(saved))) return String(saved);
 
-  // B) most recent locked (highest round_number)
   const locked = rounds
     .filter((r) => r.is_locked)
     .sort((a, b) => (Number(b.round_number) || 0) - (Number(a.round_number) || 0));
   if (locked.length > 0) return String(locked[0].id);
 
-  // fallback: current
   const current = rounds.find((r) => r.is_current);
   if (current) return String(current.id);
 
-  // fallback: first
   return rounds[0] ? String(rounds[0].id) : "";
 }
 
@@ -173,7 +169,6 @@ export default function MyTeamPage() {
       if (playersError) return setError(playersError.message);
       if (meError) return setError(meError.message);
 
-      // ✅ store buy-in (null means not answered yet)
       const amt = meData?.buy_in_amount;
       setBuyInAmount(amt == null ? null : Number(amt));
 
@@ -204,6 +199,68 @@ export default function MyTeamPage() {
 
   const isLocked = selectedRound?.is_locked ?? false;
 
+  // ✅ Auto-copy previous round roster when a NEW roster is created for this round
+  async function tryAutoCopyFromPreviousRound(params: {
+    userId: string;
+    newRosterId: string | number;
+    currentRoundId: string;
+  }) {
+    const { userId, newRosterId, currentRoundId } = params;
+
+    // Need round_number to find previous round
+    const cur = rounds.find((r) => String(r.id) === String(currentRoundId));
+    if (!cur) return;
+
+    // Only copy if not round 1
+    const curNum = Number(cur.round_number) || 0;
+    if (curNum <= 1) return;
+
+    const prev = rounds.find((r) => (Number(r.round_number) || 0) === curNum - 1);
+    if (!prev) return;
+
+    // Find previous roster
+    const { data: prevRoster, error: prevRosterErr } = await supabase
+      .from("rosters")
+      .select("id")
+      .eq("user_id", userId)
+      .eq("round_id", String(prev.id))
+      .maybeSingle();
+
+    if (prevRosterErr) throw prevRosterErr;
+    if (!prevRoster?.id) return;
+
+    // Load previous roster players
+    const { data: prevRp, error: prevRpErr } = await supabase
+      .from("roster_players")
+      .select("slot, player_id")
+      .eq("roster_id", prevRoster.id);
+
+    if (prevRpErr) throw prevRpErr;
+
+    // Only keep players that still exist in current players table
+    // (your manual workflow: remove eliminated players from `players`)
+    const upsertRows = (prevRp ?? []).map((row: any) => {
+      const slot = row.slot as SlotKey;
+      const pid = row.player_id ? String(row.player_id) : "";
+
+      const stillExists = pid && playersById.has(pid);
+      return {
+        roster_id: newRosterId,
+        slot,
+        player_id: stillExists ? pid : null,
+      };
+    });
+
+    if (upsertRows.length === 0) return;
+
+    // Write into the NEW roster
+    const { error: upsertErr } = await supabase
+      .from("roster_players")
+      .upsert(upsertRows, { onConflict: "roster_id,slot" });
+
+    if (upsertErr) throw upsertErr;
+  }
+
   useEffect(() => {
     async function loadRosterForRound() {
       if (!userId || !selectedRoundId) return;
@@ -228,6 +285,7 @@ export default function MyTeamPage() {
       }
 
       let rId = existingRoster?.id;
+      let createdNewRoster = false;
 
       if (!rId) {
         const { data: newRoster, error: rosterInsertError } = await supabase
@@ -243,6 +301,21 @@ export default function MyTeamPage() {
         }
 
         rId = newRoster.id;
+        createdNewRoster = true;
+
+        // ✅ Attempt to auto-copy from previous round
+        try {
+          await tryAutoCopyFromPreviousRound({
+            userId,
+            newRosterId: rId,
+            currentRoundId: selectedRoundId,
+          });
+        } catch (e: any) {
+          // Don’t fail the whole page — just surface error
+          setRoundLoading(false);
+          setError(e?.message ?? "Failed to auto-copy previous round roster.");
+          return;
+        }
       }
 
       setRosterId(rId);
@@ -264,6 +337,13 @@ export default function MyTeamPage() {
         next[slot] = row.player_id ? String(row.player_id) : "";
       }
       setLineup(next);
+
+      // (Optional nice UX) tell them we copied it
+      if (createdNewRoster) {
+        // Only show a message if anything was actually carried over
+        const carried = Object.values(next).filter(Boolean).length;
+        if (carried > 0) setStatusMsg("Copied your previous round lineup (where still eligible).");
+      }
 
       if (isLocked) {
         const { data: scoreRows, error: scoreError } = await supabase
@@ -287,7 +367,8 @@ export default function MyTeamPage() {
     }
 
     loadRosterForRound();
-  }, [userId, selectedRoundId, isLocked]);
+    // IMPORTANT: depends on playersById + rounds too for auto-copy eligibility + prev round lookup
+  }, [userId, selectedRoundId, isLocked, rounds, playersById]);
 
   const selectedIds = useMemo(() => new Set(Object.values(lineup).filter(Boolean)), [lineup]);
 
@@ -309,7 +390,6 @@ export default function MyTeamPage() {
       .sort((a, b) => a.name.localeCompare(b.name));
   }
 
-  // ✅ Extracted "real save"
   async function actuallySaveLineup() {
     setError(null);
     setStatusMsg(null);
@@ -343,7 +423,6 @@ export default function MyTeamPage() {
     setStatusMsg("Saved!");
   }
 
-  // ✅ Save buy-in via RPC, then continue save if needed
   async function saveBuyInThenContinue() {
     setError(null);
     setStatusMsg(null);
@@ -370,7 +449,6 @@ export default function MyTeamPage() {
     }
   }
 
-  // ✅ Gate save: only show popup once, only on Wild Card (round_number === 1)
   async function saveLineup() {
     setError(null);
     setStatusMsg(null);
@@ -382,7 +460,6 @@ export default function MyTeamPage() {
 
     const isWildCard = selectedRound?.round_number === 1;
 
-    // show modal only the first time ever (buy_in_amount is null)
     if (isWildCard && buyInAmount == null) {
       setBuyInInput("0");
       setPendingSaveAfterBuyIn(true);
@@ -485,7 +562,6 @@ export default function MyTeamPage() {
 
             return (
               <div key={s.key} className="border rounded-xl overflow-hidden bg-white shadow-sm">
-                {/* ✅ IMAGE AREA: DEF now shows big logo like a headshot */}
                 <div className="relative h-36 bg-gray-100 flex items-center justify-center overflow-hidden">
                   {img ? (
                     <img
@@ -518,7 +594,6 @@ export default function MyTeamPage() {
                     <span className="text-xs font-semibold bg-white/90 border rounded-full px-2 py-1">{s.label}</span>
                   </div>
 
-                  {/* Team logo (top-right) */}
                   {p && (
                     <div className="absolute top-3 right-3">
                       <div className="w-10 h-10 rounded-xl bg-white/95 border shadow-sm flex items-center justify-center overflow-hidden">
@@ -590,7 +665,6 @@ export default function MyTeamPage() {
         <div className="text-xs text-gray-500">Tip: Players can only be selected once per lineup (including FLEX).</div>
       </div>
 
-      {/* ✅ BUY-IN MODAL (only shown once, only on first Wild Card save) */}
       {showBuyInModal && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
           <div className="w-full max-w-md rounded-xl bg-white p-5 shadow-lg">
