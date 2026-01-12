@@ -130,10 +130,11 @@ export default function MyTeamPage() {
 
   const [scoresBySlot, setScoresBySlot] = useState<Map<string, ScoreRow>>(new Map());
 
-  // ✅ NEW: active teams for the selected round (from public.teams_in_round)
-  const [activeTeams, setActiveTeams] = useState<Set<string>>(new Set());
-
   const roundStorageKey = "myteam_round";
+
+  // ✅ Active teams for the currently selected round.
+  // If null => no filtering (backward compatible if you haven’t populated teams_in_round yet)
+  const [activeTeams, setActiveTeams] = useState<Set<string> | null>(null);
 
   // ✅ Buy-in popup state
   const [buyInAmount, setBuyInAmount] = useState<number | null>(null);
@@ -202,34 +203,35 @@ export default function MyTeamPage() {
 
   const isLocked = selectedRound?.is_locked ?? false;
 
-  // ✅ NEW: load active teams whenever round changes
-  useEffect(() => {
-    async function loadActiveTeamsForRound() {
-      if (!selectedRoundId) return;
+  function isTeamEligible(team: string) {
+    if (!team) return false;
+    if (activeTeams === null) return true; // no filtering yet
+    return activeTeams.has(team.toUpperCase());
+  }
 
-      // If you haven’t configured teams_in_round for this round yet,
-      // we’ll allow everyone as a safe fallback (activeTeams stays empty).
-      const { data, error } = await supabase
-        .from("teams_in_round")
-        .select("team, is_active")
-        .eq("round_id", selectedRoundId)
-        .eq("is_active", true);
+  async function loadActiveTeamsForRound(roundId: string) {
+    // Pull active teams from teams_in_round
+    const { data, error } = await supabase
+      .from("teams_in_round")
+      .select("team, is_active")
+      .eq("round_id", roundId)
+      .eq("is_active", true);
 
-      if (error) {
-        // Don’t hard-fail the page if the admin hasn’t created the table/rows yet.
-        // But DO show a helpful error if you prefer:
-        // setError(error.message);
-        // return;
-        setActiveTeams(new Set());
-        return;
-      }
+    if (error) throw error;
 
-      const set = new Set<string>((data ?? []).map((r: any) => String(r.team).toUpperCase()));
-      setActiveTeams(set);
+    const rows = (data ?? []) as { team: string }[];
+
+    // If you haven't populated teams_in_round for this round yet,
+    // keep it permissive so nothing breaks.
+    if (rows.length === 0) {
+      setActiveTeams(null);
+      return null;
     }
 
-    loadActiveTeamsForRound();
-  }, [selectedRoundId]);
+    const set = new Set(rows.map((x) => String(x.team).toUpperCase()));
+    setActiveTeams(set);
+    return set;
+  }
 
   // ✅ Auto-copy previous round roster when a NEW roster is created for this round
   async function tryAutoCopyFromPreviousRound(params: {
@@ -265,23 +267,19 @@ export default function MyTeamPage() {
 
     if (prevRpErr) throw prevRpErr;
 
-    // ✅ Eligibility check:
-    // - player must exist in players table
-    // - AND (if teams_in_round is configured) their team must be active
     const upsertRows = (prevRp ?? []).map((row: any) => {
       const slot = row.slot as SlotKey;
       const pid = row.player_id ? String(row.player_id) : "";
+      const p = pid ? playersById.get(pid) : null;
 
-      const pl = pid ? playersById.get(pid) : null;
-      const exists = !!pl;
-
-      const teamsFilterEnabled = activeTeams.size > 0;
-      const teamOk = !teamsFilterEnabled ? true : (pl ? activeTeams.has(String(pl.team).toUpperCase()) : false);
+      // Only keep if player exists AND their team is eligible this round
+      const stillExists = !!p;
+      const stillEligible = !!p && isTeamEligible(p.team);
 
       return {
         roster_id: newRosterId,
         slot,
-        player_id: exists && teamOk ? pid : null,
+        player_id: stillExists && stillEligible ? pid : null,
       };
     });
 
@@ -303,6 +301,21 @@ export default function MyTeamPage() {
       setRoundLoading(true);
 
       setScoresBySlot(new Map());
+
+      // ✅ Load eligible teams for this round first
+      let eligibleSet: Set<string> | null = null;
+      try {
+        eligibleSet = await loadActiveTeamsForRound(String(selectedRoundId));
+      } catch (e: any) {
+        setRoundLoading(false);
+        setError(e?.message ?? "Failed to load eligible teams for this round.");
+        return;
+      }
+
+      const isEligibleTeam = (team: string) => {
+        if (eligibleSet === null) return true;
+        return eligibleSet.has(String(team).toUpperCase());
+      };
 
       const { data: existingRoster, error: rosterFetchError } = await supabase
         .from("rosters")
@@ -336,7 +349,7 @@ export default function MyTeamPage() {
         rId = newRoster.id;
         createdNewRoster = true;
 
-        // ✅ Attempt to auto-copy from previous round
+        // ✅ Attempt to auto-copy from previous round (now respects eligibility)
         try {
           await tryAutoCopyFromPreviousRound({
             userId,
@@ -363,12 +376,57 @@ export default function MyTeamPage() {
         return;
       }
 
+      // ✅ Build lineup, but CLEAR any player whose team isn't eligible for this round
       const next = emptyLineup();
+      const clearedSlots: SlotKey[] = [];
+
       for (const row of rosterPlayers ?? []) {
         const slot = row.slot as SlotKey;
-        next[slot] = row.player_id ? String(row.player_id) : "";
+        const pid = row.player_id ? String(row.player_id) : "";
+
+        if (!pid) {
+          next[slot] = "";
+          continue;
+        }
+
+        const p = playersById.get(pid);
+        if (!p) {
+          next[slot] = "";
+          clearedSlots.push(slot);
+          continue;
+        }
+
+        if (!isEligibleTeam(p.team)) {
+          next[slot] = "";
+          clearedSlots.push(slot);
+          continue;
+        }
+
+        next[slot] = pid;
       }
+
       setLineup(next);
+
+      // ✅ Persist the clearing in DB (only when round is OPEN)
+      if (!isLocked && clearedSlots.length > 0) {
+        const clearRows = clearedSlots.map((slot) => ({
+          roster_id: rId,
+          slot,
+          player_id: null,
+        }));
+
+        const { error: clearErr } = await supabase
+          .from("roster_players")
+          .upsert(clearRows, { onConflict: "roster_id,slot" });
+
+        if (clearErr) {
+          setRoundLoading(false);
+          setError(clearErr.message);
+          return;
+        }
+
+        setStatusMsg("Removed players that are no longer eligible for this round.");
+      }
 
       if (createdNewRoster) {
         const carried = Object.values(next).filter(Boolean).length;
@@ -397,8 +455,7 @@ export default function MyTeamPage() {
     }
 
     loadRosterForRound();
-    // depends on activeTeams too now (eligibility + auto-copy)
-  }, [userId, selectedRoundId, isLocked, rounds, playersById, activeTeams]);
+  }, [userId, selectedRoundId, isLocked, rounds, playersById]);
 
   const selectedIds = useMemo(() => new Set(Object.values(lineup).filter(Boolean)), [lineup]);
 
@@ -409,16 +466,10 @@ export default function MyTeamPage() {
 
   function optionsForSlot(slot: SlotKey) {
     const allowedPositions = SLOTS.find((s) => s.key === slot)!.allowed;
-    const teamsFilterEnabled = activeTeams.size > 0;
 
     return players
       .filter((p) => allowedPositions.includes(p.position))
-      // ✅ NEW: team eligibility filter (only if teams_in_round has rows for this round)
-      .filter((p) => {
-        if (!teamsFilterEnabled) return true;
-        return activeTeams.has(String(p.team).toUpperCase());
-      })
-      // keep the “no duplicates” rule
+      .filter((p) => isTeamEligible(p.team)) // ✅ only eligible teams
       .filter((p) => {
         const current = lineup[slot];
         if (current && String(p.id) === String(current)) return true;
@@ -443,7 +494,6 @@ export default function MyTeamPage() {
     setSaving(true);
 
     const rows = SLOTS.map((s) => ({
-
       roster_id: rosterId,
       slot: s.key,
       player_id: lineup[s.key] === "" ? null : lineup[s.key],
@@ -529,8 +579,6 @@ export default function MyTeamPage() {
     );
   }
 
-  const teamsFilterEnabled = activeTeams.size > 0;
-
   return (
     <div>
       <NavBar />
@@ -545,9 +593,6 @@ export default function MyTeamPage() {
                 {isLocked ? "Locked" : "Open"}
               </span>
               {selectedRound ? <span className="text-gray-500"> — {selectedRound.name}</span> : null}
-              {!isLocked && teamsFilterEnabled && (
-                <span className="text-gray-500"> — showing only teams still alive</span>
-              )}
             </div>
           </div>
 
@@ -585,24 +630,20 @@ export default function MyTeamPage() {
         {roundLoading && <div className="text-sm text-gray-600">Loading round...</div>}
         {statusMsg && <div className="text-sm">{statusMsg}</div>}
 
-        {!teamsFilterEnabled && !isLocked && (
-          <div className="border rounded-xl bg-gray-50 p-3 text-sm text-gray-700">
-            Heads up: team eligibility filtering isn’t configured for this round yet.{" "}
-            <span className="font-medium">All players are selectable.</span>
-          </div>
-        )}
-
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {SLOTS.map((s) => {
             const pid = lineup[s.key];
-            const p = pid ? playersById.get(String(pid)) : null;
+            const rawP = pid ? playersById.get(String(pid)) : null;
+
+            // ✅ If the player exists but is NOT eligible this round, treat as empty (no photo, no name)
+            const p = rawP && isTeamEligible(rawP.team) ? rawP : null;
+
             const score = scoresBySlot.get(String(s.key));
 
             const img = p ? headshotUrl(p) : null;
             const isDef = !!p && p.position === "DEF";
             const defLogo = isDef ? defenseLogoUrl(p.team) : null;
 
-            const showDefLogo = !!p && p.position === "DEF";
             const logo = p ? defenseLogoUrl(p.team) : null;
 
             const basePts = score?.base_points ?? 0;
@@ -641,28 +682,24 @@ export default function MyTeamPage() {
                   )}
 
                   <div className="absolute top-3 left-3">
-                    <span className="text-xs font-semibold bg-white/90 border rounded-full px-2 py-1">{s.label}</span>
+                    <span className="text-xs font-semibold bg-white/90 border rounded-full px-2 py-1">
+                      {s.label}
+                    </span>
                   </div>
 
                   {p && (
                     <div className="absolute top-3 right-3">
                       <div className="w-10 h-10 rounded-xl bg-white/95 border shadow-sm flex items-center justify-center overflow-hidden">
-                        {showDefLogo ? (
-                          <img src={logo!} alt={`${p.team} logo`} className="w-full h-full object-contain p-1" />
-                        ) : (
-                          <img
-                            src={defenseLogoUrl(p.team)}
-                            alt={`${p.team} logo`}
-                            className="w-full h-full object-contain p-1"
-                          />
-                        )}
+                        <img src={logo!} alt={`${p.team} logo`} className="w-full h-full object-contain p-1" />
                       </div>
                     </div>
                   )}
 
                   {showMult && (
                     <div className="absolute bottom-3 right-3">
-                      <div className="text-2xl font-extrabold text-blue-600 leading-none drop-shadow-sm">x{mult}</div>
+                      <div className="text-2xl font-extrabold text-blue-600 leading-none drop-shadow-sm">
+                        x{mult}
+                      </div>
                     </div>
                   )}
                 </div>
