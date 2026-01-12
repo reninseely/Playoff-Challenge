@@ -130,6 +130,9 @@ export default function MyTeamPage() {
 
   const [scoresBySlot, setScoresBySlot] = useState<Map<string, ScoreRow>>(new Map());
 
+  // ✅ NEW: active teams for the selected round (from public.teams_in_round)
+  const [activeTeams, setActiveTeams] = useState<Set<string>>(new Set());
+
   const roundStorageKey = "myteam_round";
 
   // ✅ Buy-in popup state
@@ -199,6 +202,35 @@ export default function MyTeamPage() {
 
   const isLocked = selectedRound?.is_locked ?? false;
 
+  // ✅ NEW: load active teams whenever round changes
+  useEffect(() => {
+    async function loadActiveTeamsForRound() {
+      if (!selectedRoundId) return;
+
+      // If you haven’t configured teams_in_round for this round yet,
+      // we’ll allow everyone as a safe fallback (activeTeams stays empty).
+      const { data, error } = await supabase
+        .from("teams_in_round")
+        .select("team, is_active")
+        .eq("round_id", selectedRoundId)
+        .eq("is_active", true);
+
+      if (error) {
+        // Don’t hard-fail the page if the admin hasn’t created the table/rows yet.
+        // But DO show a helpful error if you prefer:
+        // setError(error.message);
+        // return;
+        setActiveTeams(new Set());
+        return;
+      }
+
+      const set = new Set<string>((data ?? []).map((r: any) => String(r.team).toUpperCase()));
+      setActiveTeams(set);
+    }
+
+    loadActiveTeamsForRound();
+  }, [selectedRoundId]);
+
   // ✅ Auto-copy previous round roster when a NEW roster is created for this round
   async function tryAutoCopyFromPreviousRound(params: {
     userId: string;
@@ -207,18 +239,15 @@ export default function MyTeamPage() {
   }) {
     const { userId, newRosterId, currentRoundId } = params;
 
-    // Need round_number to find previous round
     const cur = rounds.find((r) => String(r.id) === String(currentRoundId));
     if (!cur) return;
 
-    // Only copy if not round 1
     const curNum = Number(cur.round_number) || 0;
     if (curNum <= 1) return;
 
     const prev = rounds.find((r) => (Number(r.round_number) || 0) === curNum - 1);
     if (!prev) return;
 
-    // Find previous roster
     const { data: prevRoster, error: prevRosterErr } = await supabase
       .from("rosters")
       .select("id")
@@ -229,7 +258,6 @@ export default function MyTeamPage() {
     if (prevRosterErr) throw prevRosterErr;
     if (!prevRoster?.id) return;
 
-    // Load previous roster players
     const { data: prevRp, error: prevRpErr } = await supabase
       .from("roster_players")
       .select("slot, player_id")
@@ -237,23 +265,28 @@ export default function MyTeamPage() {
 
     if (prevRpErr) throw prevRpErr;
 
-    // Only keep players that still exist in current players table
-    // (your manual workflow: remove eliminated players from `players`)
+    // ✅ Eligibility check:
+    // - player must exist in players table
+    // - AND (if teams_in_round is configured) their team must be active
     const upsertRows = (prevRp ?? []).map((row: any) => {
       const slot = row.slot as SlotKey;
       const pid = row.player_id ? String(row.player_id) : "";
 
-      const stillExists = pid && playersById.has(pid);
+      const pl = pid ? playersById.get(pid) : null;
+      const exists = !!pl;
+
+      const teamsFilterEnabled = activeTeams.size > 0;
+      const teamOk = !teamsFilterEnabled ? true : (pl ? activeTeams.has(String(pl.team).toUpperCase()) : false);
+
       return {
         roster_id: newRosterId,
         slot,
-        player_id: stillExists ? pid : null,
+        player_id: exists && teamOk ? pid : null,
       };
     });
 
     if (upsertRows.length === 0) return;
 
-    // Write into the NEW roster
     const { error: upsertErr } = await supabase
       .from("roster_players")
       .upsert(upsertRows, { onConflict: "roster_id,slot" });
@@ -311,7 +344,6 @@ export default function MyTeamPage() {
             currentRoundId: selectedRoundId,
           });
         } catch (e: any) {
-          // Don’t fail the whole page — just surface error
           setRoundLoading(false);
           setError(e?.message ?? "Failed to auto-copy previous round roster.");
           return;
@@ -338,9 +370,7 @@ export default function MyTeamPage() {
       }
       setLineup(next);
 
-      // (Optional nice UX) tell them we copied it
       if (createdNewRoster) {
-        // Only show a message if anything was actually carried over
         const carried = Object.values(next).filter(Boolean).length;
         if (carried > 0) setStatusMsg("Copied your previous round lineup (where still eligible).");
       }
@@ -367,8 +397,8 @@ export default function MyTeamPage() {
     }
 
     loadRosterForRound();
-    // IMPORTANT: depends on playersById + rounds too for auto-copy eligibility + prev round lookup
-  }, [userId, selectedRoundId, isLocked, rounds, playersById]);
+    // depends on activeTeams too now (eligibility + auto-copy)
+  }, [userId, selectedRoundId, isLocked, rounds, playersById, activeTeams]);
 
   const selectedIds = useMemo(() => new Set(Object.values(lineup).filter(Boolean)), [lineup]);
 
@@ -379,9 +409,16 @@ export default function MyTeamPage() {
 
   function optionsForSlot(slot: SlotKey) {
     const allowedPositions = SLOTS.find((s) => s.key === slot)!.allowed;
+    const teamsFilterEnabled = activeTeams.size > 0;
 
     return players
       .filter((p) => allowedPositions.includes(p.position))
+      // ✅ NEW: team eligibility filter (only if teams_in_round has rows for this round)
+      .filter((p) => {
+        if (!teamsFilterEnabled) return true;
+        return activeTeams.has(String(p.team).toUpperCase());
+      })
+      // keep the “no duplicates” rule
       .filter((p) => {
         const current = lineup[slot];
         if (current && String(p.id) === String(current)) return true;
@@ -406,6 +443,7 @@ export default function MyTeamPage() {
     setSaving(true);
 
     const rows = SLOTS.map((s) => ({
+
       roster_id: rosterId,
       slot: s.key,
       player_id: lineup[s.key] === "" ? null : lineup[s.key],
@@ -491,6 +529,8 @@ export default function MyTeamPage() {
     );
   }
 
+  const teamsFilterEnabled = activeTeams.size > 0;
+
   return (
     <div>
       <NavBar />
@@ -505,6 +545,9 @@ export default function MyTeamPage() {
                 {isLocked ? "Locked" : "Open"}
               </span>
               {selectedRound ? <span className="text-gray-500"> — {selectedRound.name}</span> : null}
+              {!isLocked && teamsFilterEnabled && (
+                <span className="text-gray-500"> — showing only teams still alive</span>
+              )}
             </div>
           </div>
 
@@ -541,6 +584,13 @@ export default function MyTeamPage() {
 
         {roundLoading && <div className="text-sm text-gray-600">Loading round...</div>}
         {statusMsg && <div className="text-sm">{statusMsg}</div>}
+
+        {!teamsFilterEnabled && !isLocked && (
+          <div className="border rounded-xl bg-gray-50 p-3 text-sm text-gray-700">
+            Heads up: team eligibility filtering isn’t configured for this round yet.{" "}
+            <span className="font-medium">All players are selectable.</span>
+          </div>
+        )}
 
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
           {SLOTS.map((s) => {
