@@ -72,7 +72,7 @@ function initials(name: string) {
   return (a + b).toUpperCase();
 }
 
-function computeMultiplier(base: number, total: number) {
+function computeMultiplierFromScore(base: number, total: number) {
   if (!base || base === 0) return 1;
   const raw = total / base;
   const rounded = Math.round(raw);
@@ -132,9 +132,14 @@ export default function MyTeamPage() {
 
   const roundStorageKey = "myteam_round";
 
-  // ✅ Active teams for the currently selected round.
-  // If null => no filtering (backward compatible if you haven’t populated teams_in_round yet)
+  // ✅ Eligible teams for selected round (null = no filtering)
   const [activeTeams, setActiveTeams] = useState<Set<string> | null>(null);
+
+  // ✅ Preview multipliers when round is OPEN (computed live from lineup)
+  const [previewMultBySlot, setPreviewMultBySlot] = useState<Map<SlotKey, number>>(new Map());
+
+  // ✅ NEW: per-player streak map (how many consecutive rounds they were rostered ending LAST round)
+  const [prevStreakByPlayerId, setPrevStreakByPlayerId] = useState<Map<string, number>>(new Map());
 
   // ✅ Buy-in popup state
   const [buyInAmount, setBuyInAmount] = useState<number | null>(null);
@@ -205,12 +210,11 @@ export default function MyTeamPage() {
 
   function isTeamEligible(team: string) {
     if (!team) return false;
-    if (activeTeams === null) return true; // no filtering yet
+    if (activeTeams === null) return true; // permissive when no data
     return activeTeams.has(team.toUpperCase());
   }
 
   async function loadActiveTeamsForRound(roundId: string) {
-    // Pull active teams from teams_in_round
     const { data, error } = await supabase
       .from("teams_in_round")
       .select("team, is_active")
@@ -221,8 +225,7 @@ export default function MyTeamPage() {
 
     const rows = (data ?? []) as { team: string }[];
 
-    // If you haven't populated teams_in_round for this round yet,
-    // keep it permissive so nothing breaks.
+    // If not populated yet, do not filter
     if (rows.length === 0) {
       setActiveTeams(null);
       return null;
@@ -231,6 +234,88 @@ export default function MyTeamPage() {
     const set = new Set(rows.map((x) => String(x.team).toUpperCase()));
     setActiveTeams(set);
     return set;
+  }
+
+  // ✅ NEW: build streak map per player ending LAST round (only for OPEN rounds)
+  async function buildPrevStreakMap(params: {
+    userId: string;
+    currentRoundNumber: number;
+  }) {
+    const { userId, currentRoundNumber } = params;
+
+    const result = new Map<string, number>();
+
+    if (currentRoundNumber <= 1) return result;
+
+    const prevRounds = rounds
+      .filter((r) => (Number(r.round_number) || 0) < currentRoundNumber)
+      .sort((a, b) => (Number(a.round_number) || 0) - (Number(b.round_number) || 0));
+
+    if (prevRounds.length === 0) return result;
+
+    const prevRoundIds = prevRounds.map((r) => String(r.id));
+
+    const { data: prevRosters, error: prevRostersErr } = await supabase
+      .from("rosters")
+      .select("id, round_id")
+      .eq("user_id", userId)
+      .in("round_id", prevRoundIds);
+
+    if (prevRostersErr) throw prevRostersErr;
+
+    const rosterIdByRoundId = new Map<string, string>();
+    for (const r of (prevRosters ?? []) as any[]) {
+      if (r?.round_id && r?.id) rosterIdByRoundId.set(String(r.round_id), String(r.id));
+    }
+
+    const rosterIds = Array.from(rosterIdByRoundId.values());
+    if (rosterIds.length === 0) return result;
+
+    const { data: prevRp, error: prevRpErr } = await supabase
+      .from("roster_players")
+      .select("roster_id, player_id")
+      .in("roster_id", rosterIds);
+
+    if (prevRpErr) throw prevRpErr;
+
+    // round_number -> set(player_id)
+    const playersByRoundNum = new Map<number, Set<string>>();
+    for (const r of prevRounds) playersByRoundNum.set(Number(r.round_number) || 0, new Set());
+
+    // roster_id -> round_number
+    const roundNumByRosterId = new Map<string, number>();
+    for (const r of prevRounds) {
+      const rid = rosterIdByRoundId.get(String(r.id));
+      if (rid) roundNumByRosterId.set(String(rid), Number(r.round_number) || 0);
+    }
+
+    for (const row of (prevRp ?? []) as any[]) {
+      const rid = String(row.roster_id);
+      const pid = row.player_id ? String(row.player_id) : "";
+      if (!pid) continue;
+
+      const rn = roundNumByRosterId.get(rid);
+      if (!rn) continue;
+
+      playersByRoundNum.get(rn)?.add(pid);
+    }
+
+    // streaks must end in the immediate previous round
+    const lastRoundNum = currentRoundNumber - 1;
+    const lastSet = playersByRoundNum.get(lastRoundNum);
+    if (!lastSet || lastSet.size === 0) return result;
+
+    for (const pid of lastSet) {
+      let streak = 1; // includes lastRoundNum
+      for (let rn = lastRoundNum - 1; rn >= 1; rn--) {
+        const set = playersByRoundNum.get(rn);
+        if (set && set.has(pid)) streak++;
+        else break;
+      }
+      result.set(pid, Math.min(6, Math.max(1, streak)));
+    }
+
+    return result;
   }
 
   // ✅ Auto-copy previous round roster when a NEW roster is created for this round
@@ -272,7 +357,6 @@ export default function MyTeamPage() {
       const pid = row.player_id ? String(row.player_id) : "";
       const p = pid ? playersById.get(pid) : null;
 
-      // Only keep if player exists AND their team is eligible this round
       const stillExists = !!p;
       const stillEligible = !!p && isTeamEligible(p.team);
 
@@ -301,6 +385,8 @@ export default function MyTeamPage() {
       setRoundLoading(true);
 
       setScoresBySlot(new Map());
+      setPreviewMultBySlot(new Map());
+      setPrevStreakByPlayerId(new Map());
 
       // ✅ Load eligible teams for this round first
       let eligibleSet: Set<string> | null = null;
@@ -349,7 +435,7 @@ export default function MyTeamPage() {
         rId = newRoster.id;
         createdNewRoster = true;
 
-        // ✅ Attempt to auto-copy from previous round (now respects eligibility)
+        // ✅ Attempt to auto-copy from previous round
         try {
           await tryAutoCopyFromPreviousRound({
             userId,
@@ -433,6 +519,7 @@ export default function MyTeamPage() {
         if (carried > 0) setStatusMsg("Copied your previous round lineup (where still eligible).");
       }
 
+      // ✅ LOCKED: load scoring
       if (isLocked) {
         const { data: scoreRows, error: scoreError } = await supabase
           .from("roster_spot_scores")
@@ -449,15 +536,54 @@ export default function MyTeamPage() {
         const smap = new Map<string, ScoreRow>();
         for (const s of (scoreRows ?? []) as ScoreRow[]) smap.set(String(s.slot), s);
         setScoresBySlot(smap);
+      } else {
+        // ✅ OPEN: build streak map ending LAST round
+        try {
+          const curNum = Number(selectedRound?.round_number) || 0;
+          const streakMap = await buildPrevStreakMap({
+            userId,
+            currentRoundNumber: curNum,
+          });
+          setPrevStreakByPlayerId(streakMap);
+        } catch {
+          setPrevStreakByPlayerId(new Map());
+        }
       }
 
       setRoundLoading(false);
     }
 
     loadRosterForRound();
-  }, [userId, selectedRoundId, isLocked, rounds, playersById]);
+  }, [userId, selectedRoundId, isLocked, rounds, playersById, selectedRound?.round_number]);
 
   const selectedIds = useMemo(() => new Set(Object.values(lineup).filter(Boolean)), [lineup]);
+
+  // ✅ LIVE preview multipliers derived from currently-selected player + streak map
+  useEffect(() => {
+    if (isLocked) return;
+
+    const m = new Map<SlotKey, number>();
+    for (const s of SLOTS) {
+      const pid = lineup[s.key];
+      if (!pid) {
+        m.set(s.key, 1);
+        continue;
+      }
+
+      const p = playersById.get(String(pid));
+      if (!p || !isTeamEligible(p.team)) {
+        m.set(s.key, 1);
+        continue;
+      }
+
+      const prevStreak = prevStreakByPlayerId.get(String(pid)) ?? 0;
+      const mult = prevStreak > 0 ? Math.min(6, prevStreak + 1) : 1;
+
+      m.set(s.key, mult);
+    }
+
+    setPreviewMultBySlot(m);
+  }, [lineup, prevStreakByPlayerId, isLocked, playersById, activeTeams]);
 
   function setSlot(slot: SlotKey, playerId: string) {
     setStatusMsg(null);
@@ -469,7 +595,7 @@ export default function MyTeamPage() {
 
     return players
       .filter((p) => allowedPositions.includes(p.position))
-      .filter((p) => isTeamEligible(p.team)) // ✅ only eligible teams
+      .filter((p) => isTeamEligible(p.team)) // ✅ only eligible teams for this round
       .filter((p) => {
         const current = lineup[slot];
         if (current && String(p.id) === String(current)) return true;
@@ -635,7 +761,7 @@ export default function MyTeamPage() {
             const pid = lineup[s.key];
             const rawP = pid ? playersById.get(String(pid)) : null;
 
-            // ✅ If the player exists but is NOT eligible this round, treat as empty (no photo, no name)
+            // ✅ If player exists but team isn't eligible, treat as empty
             const p = rawP && isTeamEligible(rawP.team) ? rawP : null;
 
             const score = scoresBySlot.get(String(s.key));
@@ -648,8 +774,11 @@ export default function MyTeamPage() {
 
             const basePts = score?.base_points ?? 0;
             const totalPts = score?.multiplied_points ?? 0;
-            const mult = computeMultiplier(basePts, totalPts);
-            const showMult = isLocked && score && mult > 1;
+            const lockedMult = computeMultiplierFromScore(basePts, totalPts);
+            const lockedShowMult = isLocked && score && lockedMult > 1;
+
+            const previewMult = previewMultBySlot.get(s.key) ?? 1;
+            const previewShowMult = !isLocked && p && previewMult > 1;
 
             return (
               <div key={s.key} className="border rounded-xl overflow-hidden bg-white shadow-sm">
@@ -695,10 +824,19 @@ export default function MyTeamPage() {
                     </div>
                   )}
 
-                  {showMult && (
+                  {/* ✅ MULTIPLIER BADGE (LOCKED uses scoring; OPEN uses preview streak) */}
+                  {lockedShowMult && (
                     <div className="absolute bottom-3 right-3">
                       <div className="text-2xl font-extrabold text-blue-600 leading-none drop-shadow-sm">
-                        x{mult}
+                        x{lockedMult}
+                      </div>
+                    </div>
+                  )}
+
+                  {previewShowMult && (
+                    <div className="absolute bottom-3 right-3">
+                      <div className="text-2xl font-extrabold text-blue-600 leading-none drop-shadow-sm">
+                        x{previewMult}
                       </div>
                     </div>
                   )}
@@ -736,7 +874,7 @@ export default function MyTeamPage() {
                         <span className="text-base font-bold ml-1">pts</span>
                       </div>
 
-                      {score && mult > 1 && (
+                      {score && lockedMult > 1 && (
                         <div className="text-[11px] text-gray-500 mt-1 tabular-nums">
                           Total {(totalPts ?? 0).toFixed(1)}
                         </div>
